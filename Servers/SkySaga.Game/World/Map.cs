@@ -15,6 +15,15 @@ public class Map
 
     public IEnumerable<Entity> Entities => _entities.Values;
 
+    /// <summary>
+    /// Voxels changed since the world was generated, keyed by world voxel coordinate. The
+    /// terrain itself is regenerated from a seed, so this overlay is the only record that a
+    /// block was dug or placed — without it a dug block comes back as soon as the client asks
+    /// the server about it again.
+    /// </summary>
+    /// <remarks>Air is stored as 255, the same value the generator and the wire format use.</remarks>
+    public readonly Dictionary<(int X, int Y, int Z), byte> VoxelEdits = [];
+
     public Map(MapDefinition definition)
     {
         Definition = definition;

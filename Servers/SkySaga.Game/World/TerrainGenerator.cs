@@ -27,11 +27,13 @@ public static class TerrainGenerator
     public const int ChunkSize = 32;
     public const int VoxelsPerChunk = ChunkSize * ChunkSize * ChunkSize;
 
-    // Materials confirmed to render as solid blocks.
-    private const byte Air = byte.MaxValue;
-    private const byte Dirt = 24;
-    private const byte Stone = 13;
-    private const byte Rock = 14;
+    // Block ids come from Blocks, which resolved them from the client's item CRCs. The
+    // previous values here were mislabelled: 24 is Sand, 13 is Wooden_Plank and 14 is Leaf,
+    // so the "stone" underground was really planks and leaves.
+    private const byte Air = Blocks.Air;
+    private const byte Sand = Blocks.Sand;
+    private const byte Dirt = Blocks.Dirt;
+    private const byte Stone = Blocks.Stone;
 
     public static int Seed { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("SKYSAGA_WORLD_SEED"), out var seed) ? seed : 1337;
@@ -104,6 +106,25 @@ public static class TerrainGenerator
     public static byte[] EmptyChunk() => [3, Air];
 
     /// <summary>Surface height and island underside for one column.</summary>
+    /// <summary>
+    /// The material at a world voxel, for answering "what did the player just dig?" without
+    /// regenerating a whole chunk. Returns <see cref="byte.MaxValue"/> (air) outside the ground.
+    /// </summary>
+    public static byte MaterialAt(int worldX, int worldY, int worldZ)
+    {
+        // GenerateChunk builds columns as Column(worldH1 = Z, worldH2 = X), so the arguments
+        // go in that order here too — passing X,Z reads a different column entirely.
+        var (surface, floor) = Column(worldZ, worldX);
+
+        return Material(worldY, surface, floor);
+    }
+
+    /// <summary>The material an item places, or null for items that are not terrain blocks.</summary>
+    public static byte? MaterialFor(string itemName) => Blocks.MaterialFor(itemName);
+
+    /// <summary>The item a broken voxel drops, or null for materials with no item.</summary>
+    public static string? LootFor(byte material) => Blocks.ItemFor(material);
+
     private static (int Surface, int Floor) Column(int h1, int h2)
     {
         // Rolling surface.
@@ -122,13 +143,11 @@ public static class TerrainGenerator
         if (y > surface || y < floor)
             return Air;
 
-        if (y == surface)
-            return Dirt;
-
+        // A desert island: sand on top, dirt under it, stone at depth.
         if (y > surface - 4)
-            return Dirt;
+            return Sand;
 
-        return y < floor + 3 ? Rock : Stone;
+        return y < floor + 3 ? Stone : Dirt;
     }
 
     /// <summary>Value noise with a few octaves; deterministic, no allocations.</summary>

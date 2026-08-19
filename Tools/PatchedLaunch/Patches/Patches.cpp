@@ -201,6 +201,13 @@ void* __fastcall hk_JsonGetMember(void* thisPtr, void* edx, const char* name)
 	return o_JsonGetMember(thisPtr, edx, name);
 }
 
+// Detour for FUN_0087a630, the interaction gate. The HUD (FUN_007fe280) only offers
+// InteractMode when this returns non-zero AND the component's byte at +0x38 is set; otherwise
+// it falls back to the pickup prompt ("Your inventory is full"). Dumping the component's live
+// fields here says which of our synced flags actually landed and what the interaction angles
+// are - the thing a static decompile of this function could not tell us.
+//
+// Rate-limited: this runs every frame the player looks at an interactable.
 HANDLE WINAPI hk_CreateMutexA(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner, LPCSTR lpName)
 {
 	HANDLE hResult = o_CreateMutexA(lpMutexAttributes, bInitialOwner, lpName);
@@ -259,6 +266,12 @@ HANDLE WINAPI hk_CreateMutexA(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bIni
 
 			PatchLog("[patches] JsonGetMember hook enabled (schema capture)\n");
 		}
+
+		// NOTE: hooking the interaction gate FUN_0087a630 (0x87A630) was tried and REMOVED.
+		// It crashed the client both as a typed __fastcall detour and as a register-preserving
+		// naked detour, so the problem is the target rather than the calling convention: it is
+		// a very hot function (runs per frame per targeted entity) and its prologue does not
+		// survive a 5-byte patch. Read it statically with capstone instead.
 	}
 
 	return hResult;

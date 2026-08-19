@@ -41,12 +41,23 @@ public static class ClientConnected
 
         var serverInfo = new ServerInfo
         {
-            ServerOwnerGuid = "482f2571-e9a6-4f52-97bd-2231a87a9f9a",
-            ServerOwnerName = "EDITz",
+            // Must be the player's own character id, not an arbitrary GUID: the client compares
+            // this against its player entity's ClientOwnerComponent (the same Util.CharacterUuid
+            // we sync there) to decide whether the world belongs to you. With a hardcoded value
+            // they never matched, so home-island-locked items (Keystone_Oven, Airship, Mailbox,
+            // Vending_Machine) refused to place with "only on your home island".
+            ServerOwnerGuid = Util.CharacterUuid(),
+            ServerOwnerName = Environment.GetEnvironmentVariable("SKYSAGA_PLAYER_NAME") is { Length: > 0 } owner
+                ? owner
+                : "Adventurer",
             ServerBiome = Environment.GetEnvironmentVariable("SKYSAGA_BIOME") is { Length: > 0 } biome ? biome : "Desert",
             ServerAdventureCrc = adventureCrc,
             // You own (and can freely edit) a home island; quest/pvp/sandbox worlds are not
-            // "your world". IsHomeWorld is left false to match the known-good home config.
+            // "your world". Both flags matter: items with IsLockedToHomeIsland (Keystone_Oven
+            // and the other Crafting stations) refuse to be placed unless the world says it is
+            // a home world, which is why leaving IsHomeWorld false produced
+            // "This item can only be placed on your home island" while standing on the home island.
+            IsHomeWorld = isHomeIsland,
             IsMyWorld = isHomeIsland,
             ChatHost = Environment.GetEnvironmentVariable("SKYSAGA_CHAT_HOST") ?? "127.0.0.1",
             // 444 is privileged and nothing implements chat yet; a high port lets
@@ -55,7 +66,7 @@ public static class ClientConnected
         };
 
         Console.WriteLine($"[world] adventure={adventureName} worldType={worldType} ({WorldTypeName(worldType)}) "
-            + $"biome={serverInfo.ServerBiome} isMyWorld={serverInfo.IsMyWorld}");
+            + $"biome={serverInfo.ServerBiome} isHomeWorld={serverInfo.IsHomeWorld} isMyWorld={serverInfo.IsMyWorld}");
 
         connection.Send(serverInfo);
 

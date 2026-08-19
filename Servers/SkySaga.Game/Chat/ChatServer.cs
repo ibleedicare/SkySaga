@@ -196,8 +196,59 @@ public sealed class ChatServer
                 break;
             }
 
+            // Diagnostic: spawn with ONLY the transform synced, bypassing the voxel-block
+            // guard. Tells us whether a block hangs the client because of a parameter we send
+            // or because its `voxels` grid is missing.
+            case "/spawnmin":
+            {
+                if (parts.Length < 2)
+                {
+                    Reply(client, channel, "usage: /spawnmin <entity>");
+                    return;
+                }
+
+                var entity = parts[1];
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.SpawnEntity(entity, minimal: true);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
+            case "/chest":
+            {
+                // /chest            -> empty chest (minimal: interaction + transform only)
+                // /chest Dirt:10 .. -> also fills the inventory (each arg item or item:count)
+                var loot = parts.Skip(1).Select(entry =>
+                {
+                    var bits = entry.Split(':', 2);
+                    return (Name: bits[0], Count: bits.Length > 1 && int.TryParse(bits[1], out var c) ? c : 1);
+                }).ToList();
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.SpawnChest(loot);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
             case "/help":
-                Reply(client, channel, "commands: /give <item> [count], /spawn <entity>");
+                Reply(client, channel, "commands: /give <item> [count], /spawn <entity>, /chest [item[:count]...]");
                 break;
 
             default:

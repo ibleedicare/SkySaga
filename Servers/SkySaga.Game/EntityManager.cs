@@ -135,6 +135,31 @@ public static class EntityManager
         }
     }
 
+    /// <summary>
+    /// True when the entity declares a voxel-link component, i.e. it is a voxel BLOCK
+    /// (Chest, Barrel, Crate, Rock) rather than a free entity (Chicken, Tree, items).
+    /// </summary>
+    /// <remarks>
+    /// Blocks carry a <c>voxels</c> grid in <c>clientvoxellinkcomponent</c>, which is not
+    /// implemented yet. Spawning one without it hangs the client while it tries to build the
+    /// voxel structure — and because the map outlives the connection, the entity then re-hangs
+    /// the client on every reconnect until the server restarts. So spawning is refused until
+    /// the voxels wire format is reversed.
+    /// </remarks>
+    public static bool IsVoxelLinked(string name)
+    {
+        if (!_entities.TryGetValue(name, out var entityData))
+            return false;
+
+        foreach (var component in entityData.Components)
+        {
+            if (component.Name.Contains("voxellink", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     public static bool TryCreateEntity(int id, string name, [NotNullWhen(true)] out Entity? entity)
     {
         if (!_entities.TryGetValue(name, out var entityData))

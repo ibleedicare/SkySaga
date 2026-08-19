@@ -73,6 +73,10 @@ var chatPort = ushort.TryParse(Environment.GetEnvironmentVariable("SKYSAGA_CHAT_
 
 new SkySaga.Game.Chat.ChatServer(server, chatPort).Start();
 
+// Browser admin panel: a creative-mode item catalogue you drag onto a replica of the
+// player's rucksack. SKYSAGA_ADMIN=0 disables it, SKYSAGA_ADMIN_BIND changes the address.
+SkySaga.Game.Admin.AdminServer.TryStart(server);
+
 while (keepRunning)
 {
     server.Tick();

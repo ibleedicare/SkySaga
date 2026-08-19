@@ -24,7 +24,14 @@ typedef void*(__fastcall* t_BinSearch)(void* thisPtr, void* edx, void* key);
 // and the stack arg (name).
 typedef void*(__fastcall* t_JsonGetMember)(void* thisPtr, void* edx, const char* name);
 
+// FUN_0087a630: the "can I interact with this?" gate. __thiscall(interactionComponent,
+// targetEntity), so ECX is the ClientInteractionComponent whose fields we want to read:
+// interaction angles as shorts at +0x30/+0x32, flag bytes at +0x34/+0x37/+0x38 (+0x38 is the
+// one FUN_007fe280 requires for InteractMode). Modelled __fastcall to receive ECX.
+typedef int(__fastcall* t_CanInteract)(void* thisPtr, void* edx, void* target);
+
 t_LogInternal o_LogInternal = nullptr;
 t_CreateMutexA o_CreateMutexA = nullptr;
 t_BinSearch o_BinSearch = nullptr;
 t_JsonGetMember o_JsonGetMember = nullptr;
+t_CanInteract o_CanInteract = nullptr;

@@ -81,8 +81,30 @@ public static class RequestEquipInventoryItem
             return true;
         }
 
-        // Swap, so whatever was already equipped drops back into the square the new piece
-        // came from instead of being destroyed.
+        // Hand slots (0 and 1) are not a move. The hotbar holds resource references
+        // (clientuisettingscomponent.hotbarslotresources) and the stack stays in the rucksack,
+        // where placing blocks takes from it — so the inventory list is left completely alone.
+        //
+        // Two wrong versions preceded this. Swapping made the stack vanish from the bag the
+        // moment it was dragged to the hotbar. Pointing the hand slot at the same entity was
+        // worse: the client sums every slot holding that entity, so one 50 stack referenced
+        // from the bag and both hands displayed as 150.
+        if (equipSlot is 0 or 1)
+        {
+            // Record what is now in hand. Placing and digging arrive as the same voxel packet,
+            // and this is the most direct statement of which the player is doing.
+            connection.HeldResource = null;
+
+            if (bagSlot >= 0 && bagSlot < slots.Count && slots[bagSlot] != 0 &&
+                connection.Map.TryGetEntity(slots[bagSlot], out var heldEntity) &&
+                heldEntity.TryGetComponent<InventoryItemComponent>(out var heldItem))
+                connection.HeldResource = heldItem.InventorySlotData.Name;
+
+            return true;
+        }
+
+        // Armour: a real move. Swap, so whatever was already worn drops back into the square
+        // the new piece came from instead of being destroyed.
         (slots[bagSlot], slots[equipSlot]) = (slots[equipSlot], slots[bagSlot]);
 
         // Reassigning raises the change notification; mutating the list alone would not.

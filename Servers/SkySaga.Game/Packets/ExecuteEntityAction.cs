@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 
 using RakNet;
@@ -46,7 +47,14 @@ public static class ExecuteEntityAction
 
         _actions.TryGetValue((uint)actionCrc, out var actionName);
 
-        Debug.WriteLine($"srcEntityID: {srcEntityID}, targetEntityID: {targetEntityID}, actionCrc: {actionCrc}, actionName: {actionName}", nameof(ExecuteEntityAction));
+        var target = connection.Map.TryGetEntity(targetEntityID, out var targetEntity)
+            ? targetEntity.Name
+            : "?";
+
+        // Console, not Debug: this is how we see which action a key press maps to in a
+        // Release run (E on a loot chest arrives here, not as InteractWithEntity).
+        Console.WriteLine($"[action] src {srcEntityID} -> target {targetEntityID} ({target}) "
+            + $"action {actionName ?? "unknown"} (crc {(uint)actionCrc})");
 
         return true;
     }

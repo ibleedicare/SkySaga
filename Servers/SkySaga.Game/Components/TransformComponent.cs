@@ -24,9 +24,11 @@ public class TransformComponent : Component
         }
         else if (parameterName.Equals(nameof(YawDegrees), StringComparison.OrdinalIgnoreCase))
         {
-            bitStream.WriteBits(BitConverter.GetBytes(YawDegrees), 32 - Util.NumBitsRequiredUInt32(0x6400u), true);
-
-            return true;
+            // Deliberately NOT synced. Nothing on the server sets a meaningful yaw, and
+            // including it is the difference between a Chest full-sync the client accepts and
+            // one it chokes on. Returning false leaves the parameter's bit clear so the client
+            // keeps its own value instead of receiving ours.
+            return false;
         }
         else if (parameterName.Equals(nameof(Size), StringComparison.OrdinalIgnoreCase))
         {

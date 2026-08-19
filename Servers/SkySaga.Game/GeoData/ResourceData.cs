@@ -44,6 +44,16 @@ public class ResourceData
     /// <summary>Key into <c>GeoData.json > StatTemplates</c>, e.g. <c>Armour</c>.</summary>
     public string StatTemplateName { get; init; } = string.Empty;
 
+    /// <summary>
+    /// What using this item does to a voxel: <c>PlaceVoxel</c> (a block, consumed on
+    /// placement), <c>Dig</c> (a tool, not consumed), <c>CreateEntity</c>,
+    /// <c>CreateDevice</c>, <c>CreatePickupEntity</c>, or empty.
+    /// </summary>
+    public string ActionVoxel { get; init; } = string.Empty;
+
+    /// <summary>True when placing this item should take one off the stack.</summary>
+    public bool IsPlaceableBlock => ActionVoxel.Equals("PlaceVoxel", StringComparison.OrdinalIgnoreCase);
+
     public string RequiredJob { get; init; } = string.Empty;
     public int RequiredJobRank { get; init; }
 

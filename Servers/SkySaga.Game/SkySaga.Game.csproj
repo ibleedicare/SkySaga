@@ -22,6 +22,11 @@
     <None Include="..\..\Bundled\10414\geodata.json" Link="Data\GeoData.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- Item icons for the admin panel, extracted from the client's .pc archives with
+         tools/icon-extract/extract_icons.py. -->
+    <None Include="Admin\icons\*.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

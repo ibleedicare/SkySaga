@@ -34,16 +34,16 @@ namespace SkySaga.Game.Packets;
 /// landed in the wrong square. Verified with 9 -> 10 and 18 -> 9, both of which put the
 /// target at bits 14..19.
 ///
-/// The count field is 8 bits wide here, but every observation so far has been a single
-/// non-stackable item (count 1), so the boundary between it and any preceding flag bits is
-/// not yet pinned down — dragging a partial stack would settle it.
+/// The 8 bit count field is confirmed: splitting a stack of 50 sends count 25, partial drags
+/// of 5 decode as 5, and a single item as 1. A count smaller than the source stack means a
+/// split rather than a move — see Connection.TrySplitStack.
 /// </remarks>
 public static class InventoryItemTransferToSlot
 {
     /// <summary>Enough to address the 45 inventory slots.</summary>
     private const uint SlotBits = 6;
 
-    /// <summary>Stack size being moved. Only ever seen as 1 so far.</summary>
+    /// <summary>Stack size being moved; smaller than the stack means a split.</summary>
     private const uint CountBits = 8;
 
     /// <summary>
@@ -116,6 +116,16 @@ public static class InventoryItemTransferToSlot
         if (sourceSlot < 0 || sourceSlot >= slots.Count || targetSlot < 0 || targetSlot >= slots.Count)
         {
             Console.WriteLine($"[inventory] slot out of range (have {slots.Count})");
+
+            return true;
+        }
+
+        // A count smaller than the stack is a split, not a move: dragging half of a 50 stack
+        // arrives here as count 25. TrySplitStack returns false when this is an ordinary whole
+        // stack move, which then falls through to the swap below.
+        if (connection.TrySplitStack(sourceSlot, targetSlot, count))
+        {
+            Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
 
             return true;
         }

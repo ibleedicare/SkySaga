@@ -172,6 +172,8 @@ public static class GeoDataManager
                 IsTwoHanded = Bool(resourceElement, "IsTwoHanded"),
                 IsUsableByPlayer = Bool(resourceElement, "IsUsableByPlayer"),
 
+                ActionVoxel = String(resourceElement, "ActionVoxel"),
+
                 SubCategory = String(resourceElement, "SubCategory"),
                 RarityLevel = String(resourceElement, "RarityLevel"),
                 StatTemplateName = String(resourceElement, "StatTemplateName"),
