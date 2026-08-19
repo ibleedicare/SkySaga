@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Diagnostics;
@@ -42,7 +43,19 @@ while (true)
 
     var loginReply = new LoginReply();
 
-    loginReply.Result = loginRequest.Username != "EDITz" || loginRequest.Password != "EDITz" ? 1 : 0;
+    // Accept any non-empty credentials so the launcher can sign in with any account.
+    // Set SKYSAGA_ACCOUNTS=user:pass,other:pass to restrict it to a fixed list.
+    var accounts = Environment.GetEnvironmentVariable("SKYSAGA_ACCOUNTS");
+
+    var accepted = string.IsNullOrWhiteSpace(accounts)
+        ? !string.IsNullOrWhiteSpace(loginRequest.Username)
+        : accounts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(entry => entry.Split(':', 2) is [var user, var password]
+                && user == loginRequest.Username && password == loginRequest.Password);
+
+    Console.WriteLine($"[auth] login {loginRequest.Username} -> {(accepted ? "accepted" : "rejected")}");
+
+    loginReply.Result = accepted ? 0 : 1;
 
     loginReply.Username = loginRequest.Username;
     loginReply.Token = Guid.NewGuid().ToString();

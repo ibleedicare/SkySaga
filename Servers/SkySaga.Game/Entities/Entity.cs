@@ -43,7 +43,9 @@ public class Entity
     {
         var syncIndex = _entityData.GetParameterSyncIndex(component.Name, parameter);
 
-        if (syncIndex > 0)
+        // Sync indices are dense from 0, and GetParameterSyncIndex returns -1 when
+        // the parameter is not synced - so 0 is a valid index, not a miss.
+        if (syncIndex >= 0)
             _sync.Set(syncIndex, true);
     }
 

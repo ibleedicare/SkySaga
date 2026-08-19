@@ -19,7 +19,13 @@ public static class BitStreamExtensions
 
         bitStream.Read(out messageIdPart);
 
-        return byte.MaxValue - (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM + messageIdPart;
+        // Extended (2-byte) id: WritePacketId emits 0xFF then (packetIndex - 121) for
+        // indices >= 121. The decoded message id must be 255 + that second byte, so that
+        // ProcessPackets' `(PacketId)messageId - ID_USER_PACKET_ENUM` (with its byte wrap)
+        // recovers the real index. The old form subtracted ID_USER_PACKET_ENUM a second
+        // time, collapsing every extended packet (e.g. NotifyPhotoCaptured = 150) onto a
+        // low id (16 = RequestUISettingsSetActiveSlot).
+        return byte.MaxValue + messageIdPart;
     }
 
     public static string ReadString(this BitStream bitStream)
@@ -71,6 +77,35 @@ public static class BitStreamExtensions
     public static void WriteUInt64(this BitStream bitStream, ulong value)
     {
         bitStream.WriteBits(BitConverter.GetBytes(value), sizeof(ulong) * 8, true);
+    }
+
+    /// <summary>
+    /// The client's small-int-optimised uint used by the photo packets (FUN_00791210 /
+    /// FUN_0073dab0): one flag bit, then 7 bits if the value is &lt; 128, else the full 32.
+    /// </summary>
+    public static void WriteCompressedUInt(this BitStream bitStream, uint value)
+    {
+        if (value < 0x80)
+        {
+            bitStream.Write0();
+            bitStream.WriteBits(BitConverter.GetBytes(value), 7, true);
+        }
+        else
+        {
+            bitStream.Write1();
+            bitStream.WriteBits(BitConverter.GetBytes(value), 32, true);
+        }
+    }
+
+    public static uint ReadCompressedUInt(this BitStream bitStream)
+    {
+        var large = bitStream.ReadBit();
+
+        var buffer = new byte[4];
+
+        bitStream.ReadBits(buffer, large ? 32u : 7u, true);
+
+        return BitConverter.ToUInt32(buffer, 0);
     }
 
     public static void WriteString(this BitStream bitStream, string? value)
@@ -143,6 +178,36 @@ public static class BitStreamExtensions
             Array.Reverse(data, i * 4, 4);
 
         bitStream.WriteBits(data, (uint)count);
+    }
+
+    /// <summary>
+    /// Reads an integer of an arbitrary bit width.
+    /// </summary>
+    /// <remarks>
+    /// <c>ReadBits</c> fills the buffer most significant byte first, with only the final
+    /// partial byte right aligned, so reinterpreting the buffer with BitConverter only
+    /// works when the width is a multiple of eight. Reading 12 bits of the value 19 gives
+    /// the bytes 01 03, which BitConverter reads as 769.
+    /// </remarks>
+    public static bool TryReadBitsValue(this BitStream bitStream, uint numberOfBits, out int value)
+    {
+        value = 0;
+
+        var buffer = new byte[(numberOfBits + 7) / 8];
+
+        if (!bitStream.ReadBits(buffer, numberOfBits, true))
+            return false;
+
+        var wholeBytes = (int)(numberOfBits / 8);
+        var remainingBits = (int)(numberOfBits % 8);
+
+        for (var i = 0; i < wholeBytes; i++)
+            value = (value << 8) | buffer[i];
+
+        if (remainingBits > 0)
+            value = (value << remainingBits) | buffer[wholeBytes];
+
+        return true;
     }
 
     #endregion

@@ -16,6 +16,12 @@
     <None Update="Data\Entities.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- The item table, linked straight out of the files bundled with client 10414 so it
+         cannot drift from the client it targets. Regenerate with
+         tools/entity-extract/extract_bundled.py. -->
+    <None Include="..\..\Bundled\10414\geodata.json" Link="Data\GeoData.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

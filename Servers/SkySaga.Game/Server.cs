@@ -1,8 +1,10 @@
 ﻿using System;
+using System.Linq;
 using System.Numerics;
 using System.Diagnostics;
 using System.Collections.Frozen;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 
 using RakNet;
 
@@ -23,6 +25,16 @@ public class Server : IDisposable
 
     private readonly Dictionary<int, Map> _maps = new();
     private readonly Dictionary<ulong, Connection> _connections = new();
+
+    // Work handed in from other threads (the chat/IRC server) to run on the game thread,
+    // where touching connections and entities is safe. Drained each Tick.
+    private readonly ConcurrentQueue<Action> _commands = new();
+
+    /// <summary>The first (typically only) connected player, for single-player admin commands.</summary>
+    public Connection? FirstConnection => _connections.Values.FirstOrDefault();
+
+    /// <summary>Queue work to run on the game thread at the next tick.</summary>
+    public void Enqueue(Action action) => _commands.Enqueue(action);
 
     public Server(string password, ushort port)
     {
@@ -62,8 +74,18 @@ public class Server : IDisposable
         {
             if (timeOfDay.TryGetComponent<ClientTimeOfDayComponent>(out var clientTimeOfDayComponent))
             {
-                clientTimeOfDayComponent.StartTimeOfDay = 65536 * 2;
-                clientTimeOfDayComponent.FixedTimeOfDay = false;
+                // Freeze at midday by default: the 64 second day/night cycle otherwise
+                // leaves the world dark half the time, which makes terrain work impossible
+                // to look at. SKYSAGA_TIME_OF_DAY overrides the value (65536 = full cycle,
+                // so 32768 is midday); SKYSAGA_TIME_OF_DAY=cycle restores the cycle.
+                var timeOfDaySetting = Environment.GetEnvironmentVariable("SKYSAGA_TIME_OF_DAY");
+
+                var cycling = string.Equals(timeOfDaySetting, "cycle", StringComparison.OrdinalIgnoreCase);
+
+                clientTimeOfDayComponent.StartTimeOfDay =
+                    int.TryParse(timeOfDaySetting, out var configuredTime) ? configuredTime : 65536 / 2;
+
+                clientTimeOfDayComponent.FixedTimeOfDay = !cycling;
                 clientTimeOfDayComponent.DayNightCycleDuration = 64;
                 clientTimeOfDayComponent.RealWorldStartTime = RakNet.RakNet.GetTime();
                 clientTimeOfDayComponent.TimeStretch = 64;
@@ -131,10 +153,27 @@ public class Server : IDisposable
 
     public void Tick()
     {
+        ProcessCommands();
+
         ProcessPackets();
 
         ProcessMaps();
         ProcessConnections();
+    }
+
+    private void ProcessCommands()
+    {
+        while (_commands.TryDequeue(out var command))
+        {
+            try
+            {
+                command();
+            }
+            catch (Exception exception)
+            {
+                Console.WriteLine($"[command] failed: {exception.Message}");
+            }
+        }
     }
 
     private void ProcessPackets()
@@ -147,6 +186,9 @@ public class Server : IDisposable
         var bitStream = new BitStream(packet.data, packet.length, false);
 
         var messageId = bitStream.ReadMessageId();
+
+        Console.WriteLine($"[recv] guid {packet.guid.g} msgId {messageId} "
+            + $"({(DefaultMessageIDTypes)messageId}) length {packet.length}");
 
         if (!_connections.TryGetValue(packet.guid.g, out var connection)
             && messageId == (byte)DefaultMessageIDTypes.ID_NEW_INCOMING_CONNECTION)
@@ -179,10 +221,34 @@ public class Server : IDisposable
         {
             var packetId = (PacketId)messageId - (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM;
 
-            var handled = connection.ProcessPacket(packetId, bitStream);
+            bool handled;
+
+            // A malformed or half-understood packet must never take the whole server down;
+            // log it and keep serving.
+            try
+            {
+                handled = connection.ProcessPacket(packetId, bitStream);
+            }
+            catch (Exception exception)
+            {
+                Console.WriteLine($"[error] handling {packetId} threw: {exception.Message}");
+
+                handled = true;
+            }
 
             if (!handled)
-                Debug.WriteLine($"Unhandled Packet. ( Length: {packet.length} )", packetId.ToString());
+            {
+                // Dump the bytes too: these are client -> server packets, so there is no
+                // deserializer in the client to read the layout from. Correlating hex
+                // against a known action (drag item from slot A to slot B) is how their
+                // formats get worked out.
+                var bytes = new byte[Math.Min(packet.length, 64u)];
+
+                for (var i = 0; i < bytes.Length; i++)
+                    bytes[i] = packet.data[i];
+
+                Console.WriteLine($"[warn] unhandled packet {packetId} ( Length: {packet.length} ) {Convert.ToHexString(bytes)}");
+            }
         }
 
     Deallocate:
@@ -221,7 +287,13 @@ public class Server : IDisposable
 
     public void Send(BitStream bitStream, AddressOrGUID systemIdentifier)
     {
-        _peer.Send(bitStream, PacketPriority.HIGH_PRIORITY, PacketReliability.RELIABLE_ORDERED, (char)0, systemIdentifier, false);
+        var sent = _peer.Send(bitStream, PacketPriority.HIGH_PRIORITY, PacketReliability.RELIABLE_ORDERED, (char)0, systemIdentifier, false);
+
+        // bitStream.GetData()[0] is the RakNet message id; game ids start at ID_USER_PACKET_ENUM.
+        var messageId = bitStream.GetNumberOfBytesUsed() > 0 ? bitStream.GetData()[0] : (byte)0;
+        var packetId = (PacketId)(messageId - (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM);
+
+        Console.WriteLine($"[send] {packetId} bytes {bitStream.GetNumberOfBytesUsed()} sent {sent}");
     }
 
     public void SendToAll(ISerializablePacket packet)
@@ -234,6 +306,8 @@ public class Server : IDisposable
 
     private void OnConnectionAdded(Connection connection)
     {
+        Console.WriteLine($"[conn] client {connection.Guid.g} connected");
+
         connection.OnConnected();
     }
 

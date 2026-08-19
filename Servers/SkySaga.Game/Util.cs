@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 
 namespace SkySaga.Game;
 
@@ -113,5 +115,39 @@ public static class Util
     public static string NewGuid()
     {
         return Guid.NewGuid().ToString();
+    }
+
+    private static string? _characterUuid;
+
+    /// <summary>
+    /// The character UUID the web server handed to the client, used as the owner id the
+    /// client puts in its social-graph requests. Fetched once from
+    /// <c>GET /GetGUID</c>; override the address with SKYSAGA_WEB_URL.
+    /// </summary>
+    public static string CharacterUuid()
+    {
+        if (_characterUuid is not null)
+            return _characterUuid;
+
+        var webUrl = Environment.GetEnvironmentVariable("SKYSAGA_WEB_URL") ?? "http://127.0.0.1:5164";
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+            using var document = JsonDocument.Parse(client.GetStringAsync($"{webUrl}/GetGUID").Result);
+
+            _characterUuid = document.RootElement.GetProperty("result").GetProperty("GUID").GetString();
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine($"[owner] could not read /GetGUID ({exception.Message}); using a random uuid");
+        }
+
+        _characterUuid ??= NewGuid();
+
+        Console.WriteLine($"[owner] character uuid {_characterUuid}");
+
+        return _characterUuid;
     }
 }

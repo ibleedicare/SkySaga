@@ -43,6 +43,10 @@ public static class EntityMoved
         {
             if (connection.Player.TryGetComponent<SmoothedTransformComponent>(out var smoothedTransformComponent))
                 smoothedTransformComponent.Position = new Vector<int>([positionX, positionY, positionZ, 0, 0, 0, 0, 0]);
+
+            // Track the player's facing for /spawn, but NOT via the synced YawDegrees param:
+            // syncing yawdegrees back mid-gameplay null-derefs the client (crash eip=0x420a43).
+            connection.FacingYawDegrees = yaw;
         }
 
         return true;

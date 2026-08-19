@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 
 using RakNet;
 
@@ -16,6 +17,15 @@ public static class ClientReadyToPlay
         };
 
         connection.Send(setClientEntity);
+
+        // The client otherwise stays in tutorial mode and spills hint text into the chat
+        // log. Experimental — see DebugRequestFinishTutorial. SKYSAGA_FINISH_TUTORIAL=0 off.
+        if (Environment.GetEnvironmentVariable("SKYSAGA_FINISH_TUTORIAL") != "0")
+        {
+            Console.WriteLine("[tutorial] sending DebugRequestFinishTutorial");
+
+            connection.Send(new DebugRequestFinishTutorial());
+        }
 
         return true;
     }

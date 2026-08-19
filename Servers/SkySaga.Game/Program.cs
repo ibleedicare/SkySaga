@@ -5,6 +5,7 @@ using System.Threading;
 using RakNet;
 
 using SkySaga.Game;
+using SkySaga.Game.GeoData;
 
 var keepRunning = true;
 
@@ -42,6 +43,10 @@ catch
     return;
 }
 
+// Load the client's item table up front so a missing or broken Data/GeoData.json is
+// reported at startup rather than on the first player connect.
+GeoDataManager.Touch();
+
 ushort port = 42069;
 
 using var server = new Server("Something about penguins\0", port);
@@ -59,6 +64,14 @@ if (!server.Start())
 }
 
 Console.WriteLine($"Server has started on port {port}.");
+
+// The client's chat/IM service (IRC on the chatPort advertised in ServerInfo), which also
+// runs admin commands like "/give dirt 3". Must match ClientConnected's SKYSAGA_CHAT_PORT.
+var chatPort = ushort.TryParse(Environment.GetEnvironmentVariable("SKYSAGA_CHAT_PORT"), out var parsedChatPort)
+    ? parsedChatPort
+    : (ushort)4444;
+
+new SkySaga.Game.Chat.ChatServer(server, chatPort).Start();
 
 while (keepRunning)
 {

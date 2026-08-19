@@ -40,7 +40,7 @@ public static class EntityManager
 
     private static void LoadEntityData()
     {
-        using var fileStream = File.OpenRead(@"Data\Entities.json");
+        using var fileStream = File.OpenRead(Path.Combine("Data", "Entities.json"));
 
         using var jsonDocument = JsonDocument.Parse(fileStream);
 

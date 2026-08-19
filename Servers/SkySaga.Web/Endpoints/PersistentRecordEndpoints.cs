@@ -43,7 +43,7 @@ public static class PersistentRecordEndpoints
                         new
                         {
                             uuid = _characterUUID,
-                            name = "EDITz",
+                            name = Session.DisplayName,
                             homeBiome = "Desert", // (string?)null, // null > character creation
                             positionInList = 0
                         }

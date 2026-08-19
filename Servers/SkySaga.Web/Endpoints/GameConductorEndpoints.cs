@@ -8,6 +8,11 @@ public static class GameConductorEndpoints
 {
     public record GameConductorReserve(int Character, Guid ImUuid);
 
+    // Address handed to the client for the web/game servers. Must be reachable
+    // from wherever the client runs (a VM or container sees no 127.0.0.1 of ours).
+    private static readonly string PublicIp =
+        Environment.GetEnvironmentVariable("SKYSAGA_PUBLIC_IP") ?? "127.0.0.1";
+
     public static void MapGameConductorEndpoints(this WebApplication app)
     {
         app.MapGet("/api/game-conductor/geonode", () => new
@@ -18,7 +23,7 @@ public static class GameConductorEndpoints
                 {
                     uuid = Guid.NewGuid(),
                     datacentre = "UK",
-                    ip = "127.0.0.1",
+                    ip = PublicIp,
                     port = 5164
                 }
             }
@@ -37,7 +42,7 @@ public static class GameConductorEndpoints
             {
                 retryInMillis = 5000,
                 world = Guid.NewGuid(),
-                ip = "127.0.0.1",
+                ip = PublicIp,
                 port = 42069,
                 server = Guid.NewGuid()
             }

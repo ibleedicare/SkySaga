@@ -93,8 +93,17 @@ int main()
 	if (GetCurrentDirectory(sizeof(current_directory), current_directory) == 0)
 		return EXIT_FAILURE;
 
+	// Upstream launched with "envvarsfromfile=1", which makes the client exec a console
+	// script (Data\envvars.pc) to set its launch vars. On Linux it is simpler to pass the
+	// vars on the command line exactly as scripts/run use them. SKYSAGA_ARGS overrides the
+	// default set (e.g. to change the server address); it is read from the Linux
+	// environment, which Wine passes through.
+	const char* extraArgs = getenv("SKYSAGA_ARGS");
+	if (extraArgs == NULL || extraArgs[0] == '\0')
+		extraArgs = "ws_host=127.0.0.1 ws_port=5164 allowim=1 devimip=127.0.0.1 manport=5164 multiApp=1 useAnalytics=0";
+
 	char szCommandLine[0x2000];
-	sprintf_s(szCommandLine, "%s\\SkySaga.exe envvarsfromfile=1", current_directory);
+	sprintf_s(szCommandLine, "%s\\SkySaga.exe %s", current_directory, extraArgs);
 
 	PROCESS_INFORMATION pi;
 
