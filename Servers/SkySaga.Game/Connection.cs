@@ -1065,6 +1065,98 @@ public class Connection
         });
     }
 
+    /// <summary>
+    /// Default stack size for items that do not override it. Only 14 resources carry an
+    /// override (99 for several tools, 1 for flags and timed portals, 10 for the Mining Pick);
+    /// everything else, blocks included, uses this. 64 matches the point at which
+    /// <see cref="Packets.Common.InventorySlotData"/> switches to its wide count encoding.
+    /// </summary>
+    private const int DefaultStackLimit = 64;
+
+    private static int StackLimit(ResourceData resource)
+        => resource.IsOverridingStackLimit && resource.StackLimitOverride > 0
+            ? resource.StackLimitOverride
+            : DefaultStackLimit;
+
+    /// <summary>
+    /// Drop a stack onto another of the same item: move as much as the target can hold, up to
+    /// the stack limit. Returns false when this is not a merge (different items, empty target,
+    /// no room), leaving the caller to swap instead.
+    /// </summary>
+    public bool TryMergeStack(int sourceSlot, int targetSlot, int count)
+    {
+        if (!Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+            return false;
+
+        var slots = inventory.InventoryEntityList;
+
+        if (sourceSlot == targetSlot ||
+            sourceSlot < 0 || sourceSlot >= slots.Count ||
+            targetSlot < 0 || targetSlot >= slots.Count ||
+            slots[sourceSlot] == 0 || slots[targetSlot] == 0)
+            return false;
+
+        if (!Map.TryGetEntity(slots[sourceSlot], out var source) ||
+            !source.TryGetComponent<InventoryItemComponent>(out var sourceItem) ||
+            !Map.TryGetEntity(slots[targetSlot], out var target) ||
+            !target.TryGetComponent<InventoryItemComponent>(out var targetItem))
+            return false;
+
+        var sourceData = sourceItem.InventorySlotData;
+        var targetData = targetItem.InventorySlotData;
+
+        // Only stacks of the same item merge.
+        if (sourceData.Name is not { } nameHash || targetData.Name != nameHash)
+            return false;
+
+        if (!GeoDataManager.TryGetResource(nameHash, out var resource))
+            return false;
+
+        var space = StackLimit(resource) - targetData.Count;
+
+        if (space <= 0)
+            return false;
+
+        // A drag of part of a stack asks for that many; a whole-stack drag asks for all of it.
+        var wanted = count > 0 ? Math.Min(count, sourceData.Count) : sourceData.Count;
+
+        var moved = Math.Min(wanted, space);
+
+        if (moved <= 0)
+            return false;
+
+        targetData.Count += moved;
+
+        // Reassign so the setters raise the change and both stacks sync.
+        targetItem.InventorySlotData = targetData;
+
+        sourceData.Count -= moved;
+
+        if (sourceData.Count > 0)
+        {
+            sourceItem.InventorySlotData = sourceData;
+        }
+        else
+        {
+            var entityId = slots[sourceSlot];
+
+            slots[sourceSlot] = 0;
+
+            inventory.InventoryEntityList = slots;
+
+            Map.RemoveEntity(source);
+
+            Send(new EntityRemoved { Id = entityId });
+
+            ItemNames.Remove(entityId);
+        }
+
+        Console.WriteLine($"[inventory] merged {moved} {resource.Name} from slot {sourceSlot} "
+            + $"into slot {targetSlot} (now {targetData.Count}, {sourceData.Count} left behind)");
+
+        return true;
+    }
+
     /// <summary>Slot index to item name and stack count, for the admin panel's live view.</summary>
     public Dictionary<int, string> SlotContents()
     {

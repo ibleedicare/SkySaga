@@ -63,6 +63,17 @@ public static class InventoryItemSwap
             return true;
         }
 
+        // Dropping onto a square that already holds the SAME item tops that stack up instead of
+        // exchanging the two. This is the packet the client sends for a drop on an occupied
+        // square — InventoryItemTransferToSlot only covers empty ones — so the merge has to
+        // live here. Count 0 means "as much of the stack as fits".
+        if (connection.TryMergeStack(sourceSlotID, targetSlotID, 0))
+        {
+            Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
+
+            return true;
+        }
+
         (slots[sourceSlotID], slots[targetSlotID]) = (slots[targetSlotID], slots[sourceSlotID]);
 
         // Reassign so the setter raises the change and the entity syncs.

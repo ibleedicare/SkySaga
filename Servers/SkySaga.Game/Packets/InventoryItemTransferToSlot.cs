@@ -130,6 +130,16 @@ public static class InventoryItemTransferToSlot
             return true;
         }
 
+        // Dropping onto a square holding the same item tops that stack up instead of swapping.
+        // Returns false when they are different items or the target is already full, which
+        // falls through to the swap below.
+        if (connection.TryMergeStack(sourceSlot, targetSlot, count))
+        {
+            Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
+
+            return true;
+        }
+
         // Swap rather than overwrite, so dropping onto an occupied slot exchanges the two
         // instead of destroying one.
         (slots[sourceSlot], slots[targetSlot]) = (slots[targetSlot], slots[sourceSlot]);
