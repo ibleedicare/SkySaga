@@ -1,5 +1,6 @@
 ﻿using System;
 
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Builder;
 
 namespace SkySaga.Web.Endpoints;
@@ -28,6 +29,13 @@ public static class GameConductorEndpoints
                 }
             }
         });
+
+        // Ping-test results. Build 10414 posts these to /api/matchmaking/userdatacentre/create
+        // (see MatchMakingEndpoints); by Alpha V10 b36731 the route had moved under
+        // game-conductor, as RPC `HTTPRPCSendPingTestResults`. Both are served so either
+        // client works. The client sends the datacentre list from its geonode ping tests.
+        app.MapPost("/api/game-conductor/userdatacentre/create", (string[] dataCentres) =>
+            Results.Ok());
 
         app.MapPut("/api/game-conductor/reserve", (GameConductorReserve reserve) => new
         {

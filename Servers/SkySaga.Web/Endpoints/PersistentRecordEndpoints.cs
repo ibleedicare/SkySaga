@@ -52,6 +52,46 @@ public static class PersistentRecordEndpoints
             });
         });
 
+        // The 2017 builds (Alpha V10 b36731) ask for the *active* character instead of
+        // listing characters: RPC `HTTPRPCDownloadActiveCharacter`. The response field name
+        // is `character` (singular) — recovered from the client's own string table, where
+        // each RPC's field names sit next to its name and path. Build 10414 does not use
+        // this route, so adding it does not affect the retail flow.
+        //
+        // The empty case is NOT the 11001 error /characters/list returns: 36731 renders that
+        // as "No character available unused 11001" — it understood "no character" but the
+        // code is not one it handles. So "no active character" is signalled as a *success*
+        // with a null character, which is what should move the frontend to its CREATE_CHAR
+        // state (one of LOGIN / SGLOGIN / CREATE_CHAR / DOWNLOADING_CHARS / SELECTING_CHAR /
+        // CONNECT_TEST / WAIT_WORLD / REQUEST_WORLD, read out of the client's string table).
+        app.MapGet("/api/persistent-record/characters/_active", () =>
+        {
+            if (_characterUUID == Guid.Empty)
+            {
+                return Results.Ok(new
+                {
+                    result = new
+                    {
+                        character = (object?)null
+                    }
+                });
+            }
+
+            return Results.Ok(new
+            {
+                result = new
+                {
+                    character = new
+                    {
+                        uuid = _characterUUID,
+                        name = Session.DisplayName,
+                        homeBiome = "Desert",
+                        positionInList = 0
+                    }
+                }
+            });
+        });
+
         app.MapPost("/api/persistent-record/characters/_create", () =>
         {
             _characterUUID = Guid.NewGuid();
