@@ -218,6 +218,68 @@ public sealed class ChatServer
                 break;
             }
 
+            case "/next":
+            case "/prev":
+            {
+                // /next            -> remove the interactable under test, spawn the next one
+                // /prev            -> the previous one
+                // /next Workbench  -> jump straight to the first match
+                //
+                // One at a time, because a grid of all fifty collides with itself: an Airship is
+                // vehicle-sized and most devices are 2x2x3 voxel blocks.
+                var jumpTo = parts.Length > 1 ? parts[1] : null;
+
+                var step = verb == "/prev" ? -1 : 1;
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.SpawnNextInteractable(jumpTo, step);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
+            case "/spawnall":
+            {
+                // /spawnall                -> one of every entity with an interaction component
+                // /spawnall Chest          -> only those whose name contains "Chest"
+                // /spawnall @crafting      -> sweep a different component instead
+                //
+                // The point is coverage: fifty interactables laid out on a grid, each logged
+                // with its grid coordinate, so one walk tells us what opens and what does not.
+                var component = "interaction";
+
+                var args = parts.Skip(1).ToList();
+
+                if (args.Count > 0 && args[0].StartsWith('@'))
+                {
+                    component = args[0][1..];
+
+                    args.RemoveAt(0);
+                }
+
+                var nameFilter = args.Count > 0 ? args[0] : null;
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.SpawnInteractableGrid(component, nameFilter);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
             case "/spawn":
             {
                 if (parts.Length < 2)

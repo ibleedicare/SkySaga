@@ -184,81 +184,95 @@ public class Server : IDisposable
 
     private void ProcessPackets()
     {
-        var packet = _peer.Receive();
-
-        if (packet is null)
-            return;
-
-        var bitStream = new BitStream(packet.data, packet.length, false);
-
-        var messageId = bitStream.ReadMessageId();
-
-        Console.WriteLine($"[recv] guid {packet.guid.g} msgId {messageId} "
-            + $"({(DefaultMessageIDTypes)messageId}) length {packet.length}");
-
-        if (!_connections.TryGetValue(packet.guid.g, out var connection)
-            && messageId == (byte)DefaultMessageIDTypes.ID_NEW_INCOMING_CONNECTION)
+        // Drain the ENTIRE receive queue every tick.
+        //
+        // This used to take a single packet per Tick(), and Program.cs ticks at Thread.Sleep(30)
+        // — a hard ceiling of ~33 inbound packets a second. A moving player alone sends more
+        // than that (position 236 plus SetPlayerState 169 every frame), so the queue grew for as
+        // long as anyone walked around, and everything behind the backlog was served late: an
+        // InteractAction pressed at t landed seconds later. Measured on the mailbox, the
+        // open -> MailCheck round trip was 7.28s on the first open and 1.61s on the second,
+        // which is the backlog draining, not the client thinking.
+        //
+        // Receive() returns null when the queue is empty, so the loop always terminates.
+        while (true)
         {
-            // TODO: Decide which map the connection uses
-            connection = new Connection(this, _maps[0], packet.guid);
+            var packet = _peer.Receive();
 
-            _connections.TryAdd(packet.guid.g, connection);
+            if (packet is null)
+                return;
 
-            OnConnectionAdded(connection);
+            var bitStream = new BitStream(packet.data, packet.length, false);
 
-            goto Deallocate;
-        }
+            var messageId = bitStream.ReadMessageId();
 
-        if (connection is null)
-            goto Deallocate;
+            Console.WriteLine($"[recv] guid {packet.guid.g} msgId {messageId} "
+                + $"({(DefaultMessageIDTypes)messageId}) length {packet.length}");
 
-        if (messageId == (byte)DefaultMessageIDTypes.ID_CONNECTION_LOST ||
-            messageId == (byte)DefaultMessageIDTypes.ID_DISCONNECTION_NOTIFICATION)
-        {
-            if (!_connections.Remove(packet.guid.g, out connection))
-                throw new InvalidOperationException();
-
-            OnConnectionRemoved(connection);
-
-            goto Deallocate;
-        }
-
-        if (messageId >= (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM)
-        {
-            var packetId = (PacketId)messageId - (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM;
-
-            bool handled;
-
-            // A malformed or half-understood packet must never take the whole server down;
-            // log it and keep serving.
-            try
+            if (!_connections.TryGetValue(packet.guid.g, out var connection)
+                && messageId == (byte)DefaultMessageIDTypes.ID_NEW_INCOMING_CONNECTION)
             {
-                handled = connection.ProcessPacket(packetId, bitStream);
-            }
-            catch (Exception exception)
-            {
-                Console.WriteLine($"[error] handling {packetId} threw: {exception.Message}");
+                // TODO: Decide which map the connection uses
+                connection = new Connection(this, _maps[0], packet.guid);
 
-                handled = true;
+                _connections.TryAdd(packet.guid.g, connection);
+
+                OnConnectionAdded(connection);
+
+                goto Deallocate;
             }
 
-            if (!handled)
+            if (connection is null)
+                goto Deallocate;
+
+            if (messageId == (byte)DefaultMessageIDTypes.ID_CONNECTION_LOST ||
+                messageId == (byte)DefaultMessageIDTypes.ID_DISCONNECTION_NOTIFICATION)
             {
-                // Dump the bytes too: these are client -> server packets, so there is no
-                // deserializer in the client to read the layout from. Correlating hex
-                // against a known action (drag item from slot A to slot B) is how their
-                // formats get worked out.
-                var bytes = new byte[Math.Min(packet.length, 64u)];
+                if (!_connections.Remove(packet.guid.g, out connection))
+                    throw new InvalidOperationException();
 
-                for (var i = 0; i < bytes.Length; i++)
-                    bytes[i] = packet.data[i];
+                OnConnectionRemoved(connection);
 
-                Console.WriteLine($"[warn] unhandled packet {packetId} ( Length: {packet.length} ) {Convert.ToHexString(bytes)}");
+                goto Deallocate;
             }
-        }
 
-    Deallocate:
-        _peer.DeallocatePacket(packet);
+            if (messageId >= (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM)
+            {
+                var packetId = (PacketId)messageId - (byte)DefaultMessageIDTypes.ID_USER_PACKET_ENUM;
+
+                bool handled;
+
+                // A malformed or half-understood packet must never take the whole server down;
+                // log it and keep serving.
+                try
+                {
+                    handled = connection.ProcessPacket(packetId, bitStream);
+                }
+                catch (Exception exception)
+                {
+                    Console.WriteLine($"[error] handling {packetId} threw: {exception.Message}");
+
+                    handled = true;
+                }
+
+                if (!handled)
+                {
+                    // Dump the bytes too: these are client -> server packets, so there is no
+                    // deserializer in the client to read the layout from. Correlating hex
+                    // against a known action (drag item from slot A to slot B) is how their
+                    // formats get worked out.
+                    var bytes = new byte[Math.Min(packet.length, 64u)];
+
+                    for (var i = 0; i < bytes.Length; i++)
+                        bytes[i] = packet.data[i];
+
+                    Console.WriteLine($"[warn] unhandled packet {packetId} ( Length: {packet.length} ) {Convert.ToHexString(bytes)}");
+                }
+            }
+
+        Deallocate:
+            _peer.DeallocatePacket(packet);
+        }
     }
 
     private void ProcessMaps()

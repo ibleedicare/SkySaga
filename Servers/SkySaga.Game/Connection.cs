@@ -775,8 +775,12 @@ public class Connection
     /// tracked from <see cref="Packets.EntityMoved"/>. Explicit x/y/z can come later.
     /// Must run on the game thread (see <see cref="Server"/>'s command queue).
     /// </summary>
-    public string SpawnEntity(string name, bool minimal = false)
+    public string SpawnEntity(string name, bool minimal = false) => SpawnEntityCore(name, minimal, out _);
+
+    private string SpawnEntityCore(string name, bool minimal, out Entity? spawned)
     {
+        spawned = null;
+
         // The old refusal of voxel-linked entities is gone: ClientVoxelLinkComponent is
         // implemented, so `voxels` is sent and these spawn like anything else. `minimal` remains
         // the diagnostic escape hatch — it syncs ONLY what we explicitly set (position) rather
@@ -813,34 +817,7 @@ public class Connection
 
         if (!minimal)
         {
-            // Anything voxel-linked needs its anchor voxels, or it is a mesh floating outside
-            // the world grid. The shape comes from the entity's own Entities.json default.
-            if (entity.TryGetComponent<ClientVoxelLinkComponent>(out var voxelLink))
-            {
-                voxelLink.Voxels = EntityManager.GetDefaultVoxelLinks(entity.Name);
-                voxelLink.CanReplaceVoxelsOfEntityID = 0;
-            }
-
-            // Give every interactable the same baseline the chest needed: enabled, openable by
-            // anyone, and an owner string that is a real uuid rather than a null.
-            if (entity.TryGetComponent<ClientInteractionComponent>(out var interaction))
-            {
-                interaction.Enabled = true;
-                interaction.OwnerOnly = false;
-                interaction.AllowMultipleUsers = true;
-                interaction.HasBeenOpened = false;
-            }
-
-            if (entity.TryGetComponent<ClientOwnerComponent>(out var owner))
-                owner.Owner = Util.CharacterUuid();
-
-            if (entity.TryGetComponent<ClientPickupComponent>(out var pickup))
-            {
-                pickup.InventoryItemEntity = 0;
-                pickup.PlacedByUUID = Util.CharacterUuid();
-                pickup.OnlyOwnerCanPickup = true;
-                pickup.CanPickUpPopulatedInventories = false;
-            }
+            ApplyPlacedDefaults(entity);
 
             var unsendable = entity.DescribeSync().Where(x => !x.Supported).ToList();
 
@@ -862,7 +839,211 @@ public class Connection
 
         Console.WriteLine($"[spawn] {entity.Name} (id {entity.Id}) {placed}{(minimal ? " [minimal sync]" : string.Empty)}");
 
+        spawned = entity;
+
         return $"spawned {entity.Name} (id {entity.Id}) {placed}{(minimal ? " [minimal]" : string.Empty)}";
+    }
+
+    /// <summary>
+    /// The baseline every entity we drop into the world needs: its anchor voxels, an
+    /// interaction the client will offer, a real owner uuid and a describable pickup.
+    /// </summary>
+    /// <remarks>
+    /// Factored out of <see cref="SpawnEntityCore"/> so the grid and step-through spawners give
+    /// their entities exactly the same treatment a /spawn does — otherwise a failure there is
+    /// ambiguous between "the entity is broken" and "we forgot a baseline parameter".
+    /// </remarks>
+    private void ApplyPlacedDefaults(Entity entity)
+    {
+        // Anything voxel-linked needs its anchor voxels, or it is a mesh floating outside
+        // the world grid. The shape comes from the entity's own Entities.json default.
+        if (entity.TryGetComponent<ClientVoxelLinkComponent>(out var voxelLink))
+        {
+            voxelLink.Voxels = EntityManager.GetDefaultVoxelLinks(entity.Name);
+            voxelLink.CanReplaceVoxelsOfEntityID = 0;
+        }
+
+        // Give every interactable the same baseline the chest needed: enabled, openable by
+        // anyone, and an owner string that is a real uuid rather than a null.
+        if (entity.TryGetComponent<ClientInteractionComponent>(out var interaction))
+        {
+            interaction.Enabled = true;
+            interaction.OwnerOnly = false;
+            interaction.AllowMultipleUsers = true;
+            interaction.HasBeenOpened = false;
+        }
+
+        if (entity.TryGetComponent<ClientOwnerComponent>(out var owner))
+            owner.Owner = Util.CharacterUuid();
+
+        if (entity.TryGetComponent<ClientPickupComponent>(out var pickup))
+        {
+            pickup.InventoryItemEntity = 0;
+            pickup.PlacedByUUID = Util.CharacterUuid();
+            pickup.OnlyOwnerCanPickup = true;
+            pickup.CanPickUpPopulatedInventories = false;
+        }
+    }
+
+    /// <summary>
+    /// Step through the interactables one at a time: remove the one under test and put the next
+    /// one in front of the player.
+    /// </summary>
+    /// <remarks>
+    /// This, not <see cref="SpawnInteractableGrid"/>, is the way to walk the list. A grid of all
+    /// fifty collides with itself no matter how it is spaced — an Airship is a vehicle-sized
+    /// mesh and most devices are 2x2x3 voxel blocks — and overlapping meshes make "which entity
+    /// did I just press E on" unanswerable. One at a time keeps every test unambiguous and keeps
+    /// the map small.
+    ///
+    /// The previous test entity is removed, so the map does not accumulate; nothing else the
+    /// player placed is touched.
+    /// </remarks>
+    public string SpawnNextInteractable(string? jumpTo = null, int step = 1)
+    {
+        var names = EntityManager.GetEntityNamesWithComponent("interaction");
+
+        if (names.Count == 0)
+            return "no interactable entities found";
+
+        if (jumpTo is { Length: > 0 })
+        {
+            var index = names.FindIndex(x => x.Contains(jumpTo, StringComparison.OrdinalIgnoreCase));
+
+            if (index < 0)
+                return $"no interactable matches '{jumpTo}'";
+
+            _testInteractableIndex = index;
+        }
+        else
+        {
+            // Wrap in both directions so /prev off the start lands on the last one.
+            _testInteractableIndex = ((_testInteractableIndex + step) % names.Count + names.Count) % names.Count;
+        }
+
+        if (_testInteractableEntityId != 0 && Map.TryGetEntity(_testInteractableEntityId, out var previous))
+        {
+            Map.RemoveEntity(previous);
+
+            Send(new EntityRemoved { Id = previous.Id });
+
+            Console.WriteLine($"[next] removed {previous.Name} (id {previous.Id})");
+        }
+
+        _testInteractableEntityId = 0;
+
+        var name = names[_testInteractableIndex];
+
+        var result = SpawnEntityCore(name, minimal: false, out var entity);
+
+        if (entity is null)
+            return $"{_testInteractableIndex + 1}/{names.Count} {name}: {result}";
+
+        _testInteractableEntityId = entity.Id;
+
+        var unsendable = entity.DescribeSync().Where(x => !x.Supported).Select(x => x.Parameter).ToList();
+
+        Console.WriteLine($"[next] {_testInteractableIndex + 1}/{names.Count} {name} (id {entity.Id})"
+            + (unsendable.Count > 0 ? $" — cannot send: {string.Join(", ", unsendable)}" : string.Empty));
+
+        return $"{_testInteractableIndex + 1}/{names.Count} {name} (id {entity.Id})"
+            + (unsendable.Count > 0 ? $" — cannot send: {string.Join(", ", unsendable)}" : string.Empty);
+    }
+
+    private int _testInteractableIndex = -1;
+    private int _testInteractableEntityId;
+
+    /// <summary>
+    /// Spawn one of every interactable entity in a grid in front of the player, so the whole
+    /// interaction surface can be walked and tested in a single session.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SpawnEntity"/> puts everything at the same spot three voxels ahead, which is
+    /// useless for fifty entities, so this lays them out on a grid in the world axes rather than
+    /// along the player's facing. Row/column are voxel-aligned and the manifest is logged with
+    /// the grid coordinate of each entity, so a client-side failure can be tied back to a name
+    /// without guessing which mesh is which.
+    ///
+    /// Everything gets the same <see cref="ApplyPlacedDefaults"/> treatment a /spawn does, so a
+    /// failure here is a failure of the entity, not of a missing baseline parameter.
+    /// </remarks>
+    public string SpawnInteractableGrid(string componentSubstring = "interaction", string? filter = null)
+    {
+        var names = EntityManager.GetEntityNamesWithComponent(componentSubstring);
+
+        if (filter is { Length: > 0 })
+            names = names.Where(x => x.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (names.Count == 0)
+            return $"no entity declares a '{componentSubstring}' component matching '{filter}'";
+
+        if (!Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform))
+            return "the player has no transform; cannot place a grid";
+
+        // Voxels are 32 units. Four voxels apart is wide enough that the bigger devices (an
+        // Anvil is 2x2x3) do not overlap, and tight enough to walk in a few seconds.
+        const int spacing = 4 * 32;
+        const int columns = 8;
+
+        // Start one row behind and to the left of the player so the grid grows away from them
+        // rather than on top of them.
+        var originX = playerTransform.Position[0] - 2 * spacing;
+        var originZ = playerTransform.Position[2] + 2 * spacing;
+
+        var spawned = 0;
+        var failed = new List<string>();
+
+        Console.WriteLine($"[spawnall] placing {names.Count} '{componentSubstring}' entities "
+            + $"on a {columns}-wide grid, {spacing / 32} voxels apart");
+
+        for (var index = 0; index < names.Count; index++)
+        {
+            var name = names[index];
+
+            if (!Map.TryCreateEntity(name, out var entity))
+            {
+                failed.Add(name);
+
+                continue;
+            }
+
+            var column = index % columns;
+            var row = index / columns;
+
+            if (TryGetTransform(entity, out var transform))
+            {
+                transform.Position = new Vector<int>(
+                [
+                    originX + column * spacing,
+                    playerTransform.Position[1],
+                    originZ + row * spacing,
+                    0, 0, 0, 0, 0
+                ]);
+
+                transform.Size = Vector3.One;
+            }
+
+            ApplyPlacedDefaults(entity);
+
+            Send(new EntityAdd
+            {
+                Id = entity.Id,
+                NameHash = Util.ComputeCrc32(entity.Name),
+                SyncData = entity.GetSyncData(newEntity: true)
+            });
+
+            var unsendable = entity.DescribeSync().Where(x => !x.Supported).ToList();
+
+            Console.WriteLine($"[spawnall] r{row}c{column} {entity.Name} (id {entity.Id})"
+                + (unsendable.Count > 0
+                    ? $" — cannot send: {string.Join(", ", unsendable.Select(x => x.Parameter))}"
+                    : string.Empty));
+
+            spawned++;
+        }
+
+        return $"spawned {spawned} interactable(s) on a {columns}-wide grid"
+            + (failed.Count > 0 ? $"; {failed.Count} could not be created: {string.Join(", ", failed)}" : string.Empty);
     }
 
     /// <summary>
@@ -1973,23 +2154,16 @@ public class Connection
 
         // Deliberately NOT re-announcing the attachment containers here.
         //
-        // This used to re-send an EntityAdd for every container and item on each MailCheck, on
-        // the theory that the compose-time one had been discarded. It is the opposite: a repeat
-        // EntityAdd for an id the client already holds makes it tear the entity down and build a
-        // fresh one, and the rebuilt copy comes back with its slots empty. A hook on the client's
-        // slot lookup caught it directly - the container's InventoryComponent pointer changed on
-        // every open (384c5cd0 -> 384c8730 -> 34f87d70) while every slot read back as id 0.
+        // A repeat EntityAdd for an id the client already holds makes it destroy the entity and
+        // build a fresh one, which leaves every slot list that still names the old object
+        // holding a dangling pointer. That is precisely the pointer the contents recompute
+        // dereferences (FUN_007eaff0 / FUN_0088b690: `*(entity + 0xb0)` into the component-table
+        // binary search FUN_008661a0), and a stale pointer is the ONLY shape that faults there -
+        // a slot whose entity is simply absent reads back null and is skipped.
         //
-        // Worse, the parameter-changed hook (FUN_007eb5a0) fires the contents recompute
-        // FUN_007eaff0 for MaxInventorySlots/InventoryEntityList, and that starts by reading
-        // `*(*(component + 0xc) + 0xb0)` - the owning entity's component table. On an entity
-        // caught mid-rebuild that is null, so the lookup runs with this = 4 and faults reading
-        // 0x0000000c. That is the access violation the VEH caught.
-        //
-        // Announce once, at compose time, and let every later change ride the EntitySync path -
-        // which is the path that demonstrably works, since it is how /give puts an item in the
-        // player's rucksack. The channel is RELIABLE_ORDERED, so the compose-time EntityAdd is
-        // always already in front of the list that references it.
+        // Announce once, at compose time, and let later changes ride EntitySync, which is the
+        // path /give already proves. The channel is RELIABLE_ORDERED, so the compose-time
+        // EntityAdd is always in front of the list that references it.
         mailbox.MarkChanged();
 
         Send(new RemoteMailSynced());
@@ -2085,6 +2259,21 @@ public class Connection
             return false;
         }
 
+        // Put the container where the player is, if it has a transform at all.
+        //
+        // Left at the default it sits at (0,0,0) - outside every loaded chunk - and the client
+        // destroys it while `mailitemlist` still names its id. The slot walk in FUN_007eaff0 /
+        // FUN_0088b690 then reads `entity + 0xb0` through the dead pointer and faults; a slot
+        // whose entity is merely *absent* is skipped safely, so a destroyed-but-referenced
+        // entity is the only shape that crashes. That is the access violation in
+        // logs/client-internal-crash*.log.
+        if (Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform) &&
+            TryGetTransform(container, out var containerTransform))
+        {
+            containerTransform.Position = playerTransform.Position;
+            containerTransform.Size = Vector3.One;
+        }
+
         if (!container.TryGetComponent<ClientInventoryComponent>(out var inventory))
             return true;
 
@@ -2092,7 +2281,20 @@ public class Connection
         // substituted container keeps its own count so the A/B stays honest.
         var slots = containerEntity == "MailItem" ? 5 : 25;
 
-        var contents = new List<int>(new int[slots]);
+        // The list is nine entries LONGER than the slot count, and the attachments start at
+        // index nine - the same equipment prefix the player's rucksack has (FirstRucksackSlot).
+        //
+        // The mail panel is explicit about this. FUN_00794950, which fills presentSlot_%02d,
+        // walks the container's InventoryComponent from `*(inv + 0x38) + 0x120` - 0x120 / 0x20 =
+        // nine slots in - to `*(inv + 0x3c)`. FUN_00794470 then derives the attachment count as
+        // `maxinventoryslots - <empty slots from index nine on>` (FUN_00889fc0 counts those), so
+        // the arithmetic only yields the real number of attachments when the array runs nine
+        // entries past `maxinventoryslots`.
+        //
+        // Filling slots 0..4 of a five-entry list, as this used to, is invisible twice over: the
+        // UI skips every slot it wrote, and `begin + 0x120` lands past `end`, so that walk runs
+        // off the end of the array instead of terminating.
+        var contents = new List<int>(new int[FirstRucksackSlot + slots]);
 
         inventory.MaxInventorySlots = (byte)slots;
         inventory.TakeOnly = true;
@@ -2130,7 +2332,7 @@ public class Connection
                 SyncData = item.GetSyncData(newEntity: true)
             });
 
-            contents[placed++] = item.Id;
+            contents[FirstRucksackSlot + placed++] = item.Id;
 
             ItemNames[item.Id] = resource.Name;
         }
@@ -2144,19 +2346,14 @@ public class Connection
             SyncData = container.GetSyncData(newEntity: true)
         });
 
-        // Re-assign the list so its parameter goes out AGAIN, as an EntitySync, on the next tick.
+        // NOT re-assigning the list here to force a follow-up EntitySync.
         //
-        // This is not belt-and-braces, it is the whole fix. The live hook on the client's slot
-        // lookup (FUN_00794950) showed it resolving this container and finding the right slot
-        // count from `maxinventoryslots`, but every slot empty - so the EntityAdd's
-        // `inventoryentitylist` was received and not applied. The incremental path is the one
-        // that demonstrably works: /give changes the player's list and the item appears.
-        //
-        // Nothing else would resend it. GetSyncData(newEntity: true) clears the entity's dirty
-        // bits (Entities/Entity.cs), so the EntityAdd above consumed the change that
-        // Server.ProcessMaps would otherwise have picked up, and the list would travel exactly
-        // once - inside the packet that drops it. Touching the setter re-raises it.
-        inventory.InventoryEntityList = contents;
+        // That was tried, on the theory that the EntityAdd's `inventoryentitylist` is received
+        // and not applied. It puts an `EntitySync (31 B)` for the container on the wire right
+        // after its EntityAdd - a packet the one run in which an attachment ever rendered
+        // (logs/game-mailrun1.log) never sent. SyncMailbox re-announces the container in front
+        // of every list that names it, so the contents travel again there, on the EntityAdd
+        // path, without a mid-construction parameter change landing on the entity.
 
         // The attachment slots came up empty on the first live test even though the message
         // itself rendered, so say exactly what was sent: the container id the mail points at,

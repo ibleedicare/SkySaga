@@ -140,6 +140,38 @@ public static class EntityManager
     }
 
     /// <summary>
+    /// Every entity whose client side declares a component whose name contains
+    /// <paramref name="componentSubstring"/>, in Entities.json order.
+    /// </summary>
+    /// <remarks>
+    /// The use this exists for is "spawn one of every interactable and see which ones work"
+    /// (<c>/spawnall</c>): pass <c>"interaction"</c> and you get the 50 entities that offer an
+    /// E-press. Matching on a substring rather than the exact component name keeps it usable for
+    /// the other sweeps too — <c>"crafting"</c>, <c>"inventory"</c>.
+    /// </remarks>
+    public static List<string> GetEntityNamesWithComponent(string componentSubstring)
+    {
+        List<string> names = [];
+
+        foreach (var (name, entityData) in _entities)
+        {
+            foreach (var component in entityData.Components)
+            {
+                if (component.Name.Contains(componentSubstring, StringComparison.OrdinalIgnoreCase))
+                {
+                    names.Add(name);
+
+                    break;
+                }
+            }
+        }
+
+        names.Sort(StringComparer.OrdinalIgnoreCase);
+
+        return names;
+    }
+
+    /// <summary>
     /// True when the entity declares a voxel-link component, i.e. it is a voxel BLOCK
     /// (Chest, Barrel, Crate, Rock) rather than a free entity (Chicken, Tree, items).
     /// </summary>
