@@ -144,6 +144,11 @@ public class Connection
             PacketId.ExecuteEntityAction => ExecuteEntityAction.Handle(this, bitStream),
             PacketId.InteractWithEntity => InteractWithEntity.Handle(this, bitStream),
             PacketId.EntityMoved => EntityMoved.Handle(this, bitStream),
+            PacketId.MailCheck => MailCheck.Handle(this, bitStream),
+            PacketId.MailRead => MailRead.Handle(this, bitStream),
+            PacketId.MailGiftSelected => MailGiftSelected.Handle(this, bitStream),
+            PacketId.TakeMailAttachment => TakeMailAttachment.Handle(this, bitStream),
+            PacketId.DeleteMail => DeleteMail.Handle(this, bitStream),
             PacketId.SetLookAtDirection => SetLookAtDirection.Handle(this, bitStream),
             _ => false
         };
@@ -1944,4 +1949,400 @@ public class Connection
 
         return true;
     }
+    #region Mail
+
+    /// <summary>
+    /// Answer <c>MailCheck</c>: push the inbox and then tell the panel it is loaded.
+    /// </summary>
+    /// <remarks>
+    /// Both halves are required and the order is load-bearing. Marking <c>mailitemlist</c>
+    /// changed makes the next tick's <c>EntitySync</c> carry it; <c>RemoteMailSynced</c> is what
+    /// flips the panel out of its <c>mailLoading</c> state — without it the inbox spins forever
+    /// no matter how correct the list is. The channel is RELIABLE_ORDERED, so sending the
+    /// notification after marking the parameter dirty is enough to guarantee the client sees the
+    /// sync first.
+    /// </remarks>
+    public void SyncMailbox()
+    {
+        if (!Player.TryGetComponent<ClientMailBoxComponent>(out var mailbox))
+        {
+            Console.WriteLine("[mail] the player has no ClientMailBoxComponent");
+
+            return;
+        }
+
+        // Deliberately NOT re-announcing the attachment containers here.
+        //
+        // This used to re-send an EntityAdd for every container and item on each MailCheck, on
+        // the theory that the compose-time one had been discarded. It is the opposite: a repeat
+        // EntityAdd for an id the client already holds makes it tear the entity down and build a
+        // fresh one, and the rebuilt copy comes back with its slots empty. A hook on the client's
+        // slot lookup caught it directly - the container's InventoryComponent pointer changed on
+        // every open (384c5cd0 -> 384c8730 -> 34f87d70) while every slot read back as id 0.
+        //
+        // Worse, the parameter-changed hook (FUN_007eb5a0) fires the contents recompute
+        // FUN_007eaff0 for MaxInventorySlots/InventoryEntityList, and that starts by reading
+        // `*(*(component + 0xc) + 0xb0)` - the owning entity's component table. On an entity
+        // caught mid-rebuild that is null, so the lookup runs with this = 4 and faults reading
+        // 0x0000000c. That is the access violation the VEH caught.
+        //
+        // Announce once, at compose time, and let every later change ride the EntitySync path -
+        // which is the path that demonstrably works, since it is how /give puts an item in the
+        // player's rucksack. The channel is RELIABLE_ORDERED, so the compose-time EntityAdd is
+        // always already in front of the list that references it.
+        mailbox.MarkChanged();
+
+        Send(new RemoteMailSynced());
+
+        Console.WriteLine($"[mail] synced {mailbox.MailItemList.Count} message(s): "
+            + string.Join("; ", mailbox.MailItemList.Select(mail =>
+            {
+                var attachments = Map.TryGetEntity(mail.AttachmentEntity, out var container)
+                    && container.TryGetComponent<ClientInventoryComponent>(out var inventory)
+                        ? string.Join(",", inventory.InventoryEntityList)
+                        : "entity NOT on the map";
+
+                return $"'{mail.Subject}' flags={mail.Flags} attachmentEntity={mail.AttachmentEntity} [{attachments}]";
+            })));
+    }
+
+    /// <summary>
+    /// Put a message in the player's own inbox — the /mail admin command. Attachments become
+    /// real item entities inside a container entity, exactly as a chest holds loot.
+    /// Must run on the game thread.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="containerEntity"/> is a diagnostic lever, not a feature: <c>MailItem</c>
+    /// is the client's own attachment container (5 slots, take-only) and is the right answer,
+    /// but it is also the one entity in this flow the client has never been proven to
+    /// instantiate. Passing a known-good container (<c>Chest</c>) is how we tell "the client
+    /// rejects MailItem" apart from "the ids never reached the client".
+    /// </remarks>
+    public string ComposeMail(string subject, string body, IReadOnlyList<(string Name, int Count)> attachments,
+        string containerEntity = "MailItem")
+    {
+        if (!Player.TryGetComponent<ClientMailBoxComponent>(out var mailbox))
+            return "the player has no mailbox component";
+
+        var mail = new MailItem
+        {
+            Subject = subject,
+            Body = body,
+            MessageUuid = Util.NewGuid(),
+            Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        };
+
+        var placed = 0;
+
+        // "@self" is the control experiment, not a feature: it points the mail at the PLAYER's
+        // entity, which the client demonstrably has (it renders the rucksack from it) and can
+        // resolve by id. If the attachment slots then show rucksack items, the mail attachment
+        // path is sound and the fault is in how we announce the container entity; if they stay
+        // empty, the fault is in the attachment path itself.
+        if (containerEntity.Equals("self", StringComparison.OrdinalIgnoreCase))
+        {
+            mail.AttachmentEntity = Player.Id;
+
+            Console.WriteLine($"[mail] control: pointing '{subject}' at the player entity {Player.Id}");
+        }
+        else if (attachments.Count > 0 && TryCreateAttachmentContainer(containerEntity, attachments, out var container, out placed))
+        {
+            mail.AttachmentEntity = container.Id;
+        }
+
+        mailbox.MailItemList.Add(mail);
+
+        // The doorbell. The client answers it with MailCheck, which is what actually pulls the
+        // list — see SyncMailbox. Sending the sync here as well would be harmless but pointless.
+        Send(new NewMailRecieved { MessageUuid = mail.MessageUuid });
+
+        Console.WriteLine($"[mail] composed '{subject}' ({mail.MessageUuid}) with {placed} attachment(s)");
+
+        return $"sent '{subject}' with {placed} attachment(s)";
+    }
+
+    /// <summary>
+    /// Build the <c>MailItem</c> entity that holds a message's attachments.
+    /// </summary>
+    /// <remarks>
+    /// <c>MailItem</c> is the client's own container for this: a bare
+    /// <c>clientinventorycomponent</c> with <c>maxinventoryslots = 5</c> and
+    /// <c>takeonly = true</c>, and nothing else. Every item entity must reach the client before
+    /// the container's inventory references its id, and the container before
+    /// <c>mailitemlist</c> references <em>its</em> id — the same ordering rule as every other
+    /// entity-referencing parameter.
+    /// </remarks>
+    private bool TryCreateAttachmentContainer(string containerEntity,
+        IReadOnlyList<(string Name, int Count)> attachments,
+        [NotNullWhen(true)] out Entity? container, out int placed)
+    {
+        placed = 0;
+
+        if (!Map.TryCreateEntity(containerEntity, out container))
+        {
+            Console.WriteLine($"[mail] could not create the '{containerEntity}' entity");
+
+            return false;
+        }
+
+        if (!container.TryGetComponent<ClientInventoryComponent>(out var inventory))
+            return true;
+
+        // MailItem declares five, and the client draws presentSlot_00..04 to match. A
+        // substituted container keeps its own count so the A/B stays honest.
+        var slots = containerEntity == "MailItem" ? 5 : 25;
+
+        var contents = new List<int>(new int[slots]);
+
+        inventory.MaxInventorySlots = (byte)slots;
+        inventory.TakeOnly = true;
+
+        foreach (var (name, count) in attachments)
+        {
+            if (placed >= slots)
+            {
+                Console.WriteLine($"[mail] '{name}' dropped: a MailItem holds only {slots} attachments");
+
+                continue;
+            }
+
+            if (!GeoDataManager.TryGetResource(name, out var resource) || !resource.IsInventoryItem)
+            {
+                Console.WriteLine($"[mail] unknown item '{name}'; skipped");
+
+                continue;
+            }
+
+            if (!Map.TryCreateEntity("BasicInventoryItem", out var item))
+                continue;
+
+            if (item.TryGetComponent<InventoryItemComponent>(out var itemComponent))
+            {
+                itemComponent.InventorySlotData.Name = resource.NameHash;
+                itemComponent.InventorySlotData.Count = count;
+                itemComponent.InventorySlotData.ItemUUID = Util.NewGuid();
+            }
+
+            Send(new EntityAdd
+            {
+                Id = item.Id,
+                NameHash = Util.ComputeCrc32(item.Name),
+                SyncData = item.GetSyncData(newEntity: true)
+            });
+
+            contents[placed++] = item.Id;
+
+            ItemNames[item.Id] = resource.Name;
+        }
+
+        inventory.InventoryEntityList = contents;
+
+        Send(new EntityAdd
+        {
+            Id = container.Id,
+            NameHash = Util.ComputeCrc32(container.Name),
+            SyncData = container.GetSyncData(newEntity: true)
+        });
+
+        // Re-assign the list so its parameter goes out AGAIN, as an EntitySync, on the next tick.
+        //
+        // This is not belt-and-braces, it is the whole fix. The live hook on the client's slot
+        // lookup (FUN_00794950) showed it resolving this container and finding the right slot
+        // count from `maxinventoryslots`, but every slot empty - so the EntityAdd's
+        // `inventoryentitylist` was received and not applied. The incremental path is the one
+        // that demonstrably works: /give changes the player's list and the item appears.
+        //
+        // Nothing else would resend it. GetSyncData(newEntity: true) clears the entity's dirty
+        // bits (Entities/Entity.cs), so the EntityAdd above consumed the change that
+        // Server.ProcessMaps would otherwise have picked up, and the list would travel exactly
+        // once - inside the packet that drops it. Touching the setter re-raises it.
+        inventory.InventoryEntityList = contents;
+
+        // The attachment slots came up empty on the first live test even though the message
+        // itself rendered, so say exactly what was sent: the container id the mail points at,
+        // what is in it, and any parameter of it we cannot serialise.
+        var unsendable = container.DescribeSync().Where(x => !x.Supported).ToList();
+
+        Console.WriteLine($"[mail] attachment container {container.Name} (id {container.Id}) "
+            + $"slots {string.Join(",", contents)} "
+            + $"maxslots={inventory.MaxInventorySlots} takeonly={inventory.TakeOnly}"
+            + (unsendable.Count > 0
+                ? $" — cannot send: {string.Join(", ", unsendable.Select(x => x.Parameter))}"
+                : string.Empty));
+
+        return true;
+    }
+
+    /// <summary>
+    /// The player opened a message. The client has already set its own read bit, so this only
+    /// has to make the server agree — a re-sync with the bit clear would mark it unread again.
+    /// </summary>
+    public void MarkMailRead(string messageUuid)
+    {
+        if (!TryGetMail(messageUuid, out var mailbox, out var mail))
+            return;
+
+        mail.IsRead = true;
+
+        mailbox.MarkChanged();
+
+        Console.WriteLine($"[mail] read '{mail.Subject}' ({messageUuid})");
+    }
+
+    /// <summary>
+    /// The player picked a gift. Which one is not on the wire (see
+    /// <see cref="Packets.MailGiftSelected"/>) — all this records is that the choice happened,
+    /// which is what stops the client offering the buttons again.
+    /// </summary>
+    public void MarkMailGiftChosen(string messageUuid)
+    {
+        if (!TryGetMail(messageUuid, out var mailbox, out var mail))
+            return;
+
+        mail.GiftChosen = true;
+
+        mailbox.MarkChanged();
+
+        Console.WriteLine($"[mail] gift chosen on '{mail.Subject}' ({messageUuid})");
+    }
+
+    /// <summary>
+    /// Move one attachment from a message into the rucksack.
+    /// </summary>
+    /// <remarks>
+    /// The client identifies the item by its uuid, not by slot, and has already blanked its own
+    /// copy of the slot — so if the server does nothing the item is simply gone from view until
+    /// the next re-bind restores it. Both inventories and the mail list have to be re-synced.
+    /// </remarks>
+    public void ClaimMailAttachment(string messageUuid, string itemUuid)
+    {
+        if (!TryGetMail(messageUuid, out var mailbox, out var mail))
+            return;
+
+        if (!Map.TryGetEntity(mail.AttachmentEntity, out var container) ||
+            !container.TryGetComponent<ClientInventoryComponent>(out var attachments))
+        {
+            Console.WriteLine($"[mail] '{mail.Subject}' has no attachment container");
+
+            return;
+        }
+
+        if (!Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+            return;
+
+        var attachmentSlots = attachments.InventoryEntityList;
+
+        var sourceSlot = -1;
+
+        for (var slot = 0; slot < attachmentSlots.Count; slot++)
+        {
+            if (attachmentSlots[slot] != 0 &&
+                Map.TryGetEntity(attachmentSlots[slot], out var candidate) &&
+                candidate.TryGetComponent<InventoryItemComponent>(out var item) &&
+                item.InventorySlotData.ItemUUID == itemUuid)
+            {
+                sourceSlot = slot;
+                break;
+            }
+        }
+
+        if (sourceSlot < 0)
+        {
+            Console.WriteLine($"[mail] item {itemUuid} is not attached to '{mail.Subject}'");
+
+            return;
+        }
+
+        var slots = inventory.InventoryEntityList;
+
+        var targetSlot = -1;
+
+        for (var slot = FirstRucksackSlot; slot < slots.Count; slot++)
+        {
+            if (slots[slot] == 0)
+            {
+                targetSlot = slot;
+                break;
+            }
+        }
+
+        if (targetSlot < 0)
+        {
+            Console.WriteLine("[mail] rucksack is full; attachment left in the message");
+
+            // Re-sync anyway: the client blanked its slot optimistically and needs it back.
+            mailbox.MarkChanged();
+
+            return;
+        }
+
+        // The same move a chest transfer makes, so stacking, counts and both syncs behave
+        // identically to dragging the item out of a container by hand.
+        TryTransferBetweenInventories(attachments, sourceSlot, inventory, targetSlot);
+
+        mailbox.MarkChanged();
+
+        Console.WriteLine($"[mail] claimed attachment {itemUuid} from '{mail.Subject}' -> rucksack slot {targetSlot}");
+    }
+
+    /// <summary>
+    /// Discard a message and everything still attached to it. The client does not remove the row
+    /// itself — it disappears when the list re-syncs without it.
+    /// </summary>
+    public void DeleteMailMessage(string messageUuid)
+    {
+        if (!TryGetMail(messageUuid, out var mailbox, out var mail))
+            return;
+
+        if (Map.TryGetEntity(mail.AttachmentEntity, out var container))
+        {
+            if (container.TryGetComponent<ClientInventoryComponent>(out var attachments))
+            {
+                foreach (var entityId in attachments.InventoryEntityList)
+                {
+                    if (entityId == 0 || !Map.TryGetEntity(entityId, out var item))
+                        continue;
+
+                    Map.RemoveEntity(item);
+
+                    Send(new EntityRemoved { Id = entityId });
+
+                    ItemNames.Remove(entityId);
+                }
+            }
+
+            Map.RemoveEntity(container);
+
+            Send(new EntityRemoved { Id = container.Id });
+        }
+
+        mailbox.MailItemList.Remove(mail);
+
+        mailbox.MarkChanged();
+
+        Console.WriteLine($"[mail] deleted '{mail.Subject}' ({messageUuid})");
+    }
+
+    private bool TryGetMail(string messageUuid,
+        [NotNullWhen(true)] out ClientMailBoxComponent? mailbox, [NotNullWhen(true)] out MailItem? mail)
+    {
+        mail = null;
+
+        if (!Player.TryGetComponent(out mailbox))
+        {
+            Console.WriteLine("[mail] the player has no ClientMailBoxComponent");
+
+            return false;
+        }
+
+        mail = mailbox.MailItemList.Find(x => x.MessageUuid == messageUuid);
+
+        if (mail is null)
+            Console.WriteLine($"[mail] no message {messageUuid}");
+
+        return mail is not null;
+    }
+
+    #endregion
+
 }

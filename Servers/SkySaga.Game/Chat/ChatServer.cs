@@ -6,6 +6,8 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 
+using SkySaga.Game.GeoData;
+
 namespace SkySaga.Game.Chat;
 
 /// <summary>
@@ -301,6 +303,79 @@ public sealed class ChatServer
                     var result = connection is null
                         ? "no player is online"
                         : connection.SpawnChest(loot, entityName);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
+            case "/mail":
+            {
+                // /mail <subject> | <body> [item[:count] ...]
+                //
+                // Sends a message to yourself, so the whole loop — doorbell, MailCheck, sync,
+                // read, claim, delete — is testable with one player. The pipe separates subject
+                // from body because both are free text; anything after the body's first token
+                // that looks like item[:count] becomes an attachment.
+                var rest = command["/mail".Length..].Trim();
+
+                if (rest.Length == 0)
+                {
+                    Reply(client, channel, "usage: /mail [@Entity] <subject> | <body> [item[:count]...]");
+                    return;
+                }
+
+                // /mail @Chest ... swaps the attachment container. MailItem is the right entity;
+                // this is the A/B for "does the client instantiate MailItem at all".
+                var containerEntity = "MailItem";
+
+                if (rest.StartsWith('@'))
+                {
+                    var split = rest.IndexOf(' ');
+
+                    containerEntity = split < 0 ? rest[1..] : rest[1..split];
+                    rest = split < 0 ? string.Empty : rest[(split + 1)..].Trim();
+                }
+
+                var halves = rest.Split('|', 2);
+
+                var subject = halves[0].Trim();
+
+                var bodyAndItems = halves.Length > 1
+                    ? halves[1].Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                    : [];
+
+                // An attachment is a trailing token naming a real resource; everything before
+                // the first of those is the body.
+                var attachments = new List<(string Name, int Count)>();
+
+                var bodyWords = new List<string>();
+
+                foreach (var word in bodyAndItems)
+                {
+                    var bits = word.Split(':', 2);
+
+                    if (attachments.Count > 0 || GeoDataManager.TryGetResource(bits[0], out _))
+                    {
+                        attachments.Add((bits[0],
+                            bits.Length > 1 && int.TryParse(bits[1], out var c) ? c : 1));
+
+                        continue;
+                    }
+
+                    bodyWords.Add(word);
+                }
+
+                var body = string.Join(' ', bodyWords);
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.ComposeMail(subject, body, attachments, containerEntity);
 
                     Reply(client, channel, result);
                 });
