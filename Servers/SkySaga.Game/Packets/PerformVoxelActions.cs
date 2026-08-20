@@ -54,9 +54,12 @@ public static class PerformVoxelActions
         if (!TryReadCoordinate(bitStream, out var rawPower))
             return false;
 
-        if (!TryReadPosition(bitStream, out _) ||
-            !TryReadPosition(bitStream, out _) ||
-            !TryReadPosition(bitStream, out _))
+        // The exact point the player's tool struck, in entity position units (1/64 of a
+        // voxel). Keeping it raw means the loot drop lands on the block that broke without
+        // anyone having to guess the scale.
+        if (!TryReadPosition(bitStream, out var hitX) ||
+            !TryReadPosition(bitStream, out var hitY) ||
+            !TryReadPosition(bitStream, out var hitZ))
             return false;
 
         if (!TryReadDirection(bitStream, out var directionX) ||
@@ -77,7 +80,7 @@ public static class PerformVoxelActions
         if (Environment.GetEnvironmentVariable("SKYSAGA_LOG_VOXEL") == "1")
         {
             Console.WriteLine($"[voxel] {location} {side} chunk({chunkX},{chunkY},{chunkZ}) "
-                + $"voxel({voxelX},{voxelY},{voxelZ}) dir({directionX},{directionY},{directionZ}) "
+                + $"voxel({voxelX},{voxelY},{voxelZ}) hit({hitX},{hitY},{hitZ}) dir({directionX},{directionY},{directionZ}) "
                 + $"power {power:0.##} -> {(placing ? "place" : "dig")}");
         }
 
@@ -89,7 +92,7 @@ public static class PerformVoxelActions
         }
         else
         {
-            connection.Dig(chunkX, chunkY, chunkZ, voxelX, voxelY, voxelZ);
+            connection.Dig(chunkX, chunkY, chunkZ, voxelX, voxelY, voxelZ, hitX, hitY, hitZ);
         }
 
         return true;
@@ -99,17 +102,12 @@ public static class PerformVoxelActions
     private static bool TryReadCoordinate(BitStream bitStream, out int value)
         => bitStream.TryReadBitsValue(32 - Util.NumBitsRequiredUInt32(32), out value);
 
-    private static bool TryReadPosition(BitStream bitStream, out float value)
-    {
-        value = 0;
-
-        if (!bitStream.TryReadBitsValue(32 - Util.NumBitsRequiredUInt32(0x10000), out var raw))
-            return false;
-
-        value = raw / 64f;
-
-        return true;
-    }
+    /// <summary>
+    /// A world position in entity units — 1/64 of a voxel. Returned raw rather than divided,
+    /// because that is the form every entity transform uses.
+    /// </summary>
+    private static bool TryReadPosition(BitStream bitStream, out int value)
+        => bitStream.TryReadBitsValue(32 - Util.NumBitsRequiredUInt32(0x10000), out value);
 
     private static bool TryReadDirection(BitStream bitStream, out int value)
     {

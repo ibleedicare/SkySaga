@@ -1,52 +1,67 @@
-using System.Collections.Generic;
 using System.Linq;
+
+using SkySaga.Game.GeoData;
 
 namespace SkySaga.Game.World;
 
 /// <summary>
-/// The voxel materials the client renders, and the item each one corresponds to.
+/// Block ids and the item each one drops, taken from the client's own table
+/// (<c>GeoData.json &gt; Voxels</c>, 50 entries).
 /// </summary>
 /// <remarks>
-/// Block ids come from idkb8907/SkySaga_Server, which keyed them by the item's CRC; resolving
-/// those hashes against GeoData's Resources gives the names below. This corrected three
-/// mislabelled constants in the terrain generator: 24 is Sand (not Dirt), 13 is Wooden_Plank
-/// (not Stone) and 14 is Leaf (not Rock). Placing Dirt was putting down block 24 — sandstone —
-/// which is why a placed "dirt" block looked like the terrain walls.
+/// This used to be a hand-written map assembled from item CRCs, which was both incomplete and
+/// wrong in places — it had no ore deposits and no water, and it mislabelled several ids. The
+/// real table carries a <c>VoxelIndex</c> (the byte on the wire) and a <c>Resource</c> (the
+/// item mined from it) per block, so both directions come straight from the data now.
+///
+/// Note several blocks share a drop: Dirt, Exposed_Dirt, Dirt_Frozen and Dirt_Path all yield
+/// Dirt, and every stone and ore deposit yields Stone. Going item to block therefore picks the
+/// <c>IsPlaceable</c> entry, since that is the one a player is allowed to put down.
 /// </remarks>
 public static class Blocks
 {
     public const byte Air = byte.MaxValue;
 
-    public const byte Dirt = 1;
-    public const byte Stone = 2;
-    public const byte Sand = 24;
+    /// <summary>Ids the terrain generator builds with, resolved by name from the table.</summary>
+    public static byte Dirt => Id("Dirt", 0);
+    public static byte Stone => Id("Blue_Stone", 2);
+    public static byte Sand => Id("Sand", 24);
+    public static byte Water => Id("Water", 50);
 
-    /// <summary>Block id to the item it is made of / drops.</summary>
-    private static readonly Dictionary<byte, string> Items = new()
-    {
-        [1] = "Dirt",
-        [2] = "Stone",
-        [5] = "Wood",
-        [8] = "Ice",
-        [10] = "Snow",
-        [11] = "Thatch",
-        [12] = "Gravel",
-        [13] = "Wooden_Plank",
-        [14] = "Leaf",
-        [24] = "Sand",
-        [29] = "Clay",
-        [35] = "Metal",
-        [36] = "Cactus_Pulp"
-    };
+    /// <summary>Ore veins. Not placeable — they only exist in generated terrain.</summary>
+    public static byte IronDeposit => Id("Iron_Deposit", 26);
+    public static byte CopperDeposit => Id("Copper_Deposit", 25);
+    public static byte GoldDeposit => Id("Gold_Deposit", 42);
+    public static byte LeadDeposit => Id("Lead_Deposit", 33);
 
-    private static readonly Dictionary<string, byte> Materials =
-        Items.ToDictionary(pair => pair.Value, pair => pair.Key, System.StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>The item a broken block drops, or null when it maps to nothing.</summary>
+    /// <summary>The item a broken block drops, or null when it yields nothing.</summary>
     public static string? ItemFor(byte material)
-        => Items.TryGetValue(material, out var item) ? item : null;
+        => GeoDataManager.TryGetVoxel(material, out var voxel) && voxel.Resource.Length > 0
+            ? voxel.Resource
+            : null;
 
-    /// <summary>The block an item places, or null when the item is not a terrain block.</summary>
+    /// <summary>
+    /// The block an item places, or null when the item is not a placeable block. Prefers the
+    /// entry the player is actually allowed to place.
+    /// </summary>
     public static byte? MaterialFor(string itemName)
-        => Materials.TryGetValue(itemName, out var material) ? material : null;
+    {
+        var matches = GeoDataManager.Voxels
+            .Where(voxel => string.Equals(voxel.Resource, itemName, System.StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matches.Count == 0)
+            return null;
+
+        var placeable = matches.FirstOrDefault(voxel => voxel.IsPlaceable);
+
+        return placeable?.VoxelIndex;
+    }
+
+    /// <summary>How tough a block is to mine, 0-16; ore is 10 and worked metal 16.</summary>
+    public static int ToughnessOf(byte material)
+        => GeoDataManager.TryGetVoxel(material, out var voxel) ? voxel.MiningToughness : 0;
+
+    private static byte Id(string name, byte fallback)
+        => GeoDataManager.TryGetVoxel(name, out var voxel) ? voxel.VoxelIndex : fallback;
 }

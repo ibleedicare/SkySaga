@@ -88,6 +88,7 @@ internal static class AdminPage
 
   <div class="hint">
     Drag an item from the catalogue onto a square. Click a filled square to clear it.
+    <br><a href="/editor" style="color:#ffe6b0">world editor →</a>
   </div>
   <div class="status" id="status">connecting…</div>
 </div>

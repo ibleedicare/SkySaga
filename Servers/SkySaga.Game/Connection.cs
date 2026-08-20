@@ -135,6 +135,7 @@ public class Connection
             PacketId.InventoryItemSwap => InventoryItemSwap.Handle(this, bitStream),
             PacketId.InventoryItemTransferToSlot => InventoryItemTransferToSlot.Handle(this, bitStream),
             PacketId.InventoryItemDestroy => InventoryItemDestroy.Handle(this, bitStream),
+            PacketId.InventoryItemTransferAll => InventoryItemTransferAll.Handle(this, bitStream),
             PacketId.RequestUISettingsSlotChange => RequestUISettingsSlotChange.Handle(this, bitStream),
             PacketId.RequestUISettingsSetActiveSlot => RequestUISettingsSetActiveSlot.Handle(this, bitStream),
             PacketId.RequestEquipInventoryItem => RequestEquipInventoryItem.Handle(this, bitStream),
@@ -475,6 +476,295 @@ public class Connection
     }
 
     /// <summary>
+    /// Drop a resource on the floor as a pickup the player can walk over and collect — what
+    /// breaking a block or harvesting an ore seam should produce.
+    /// </summary>
+    /// <remarks>
+    /// A floor drop is two entities. The <c>BasicInventoryItem</c> holds the resource and count
+    /// (exactly as a rucksack slot does), and the <c>Pickup</c> points at it and gives it a
+    /// position. Both must reach the client before the Pickup's id is referenced, so the item is
+    /// added first.
+    /// </remarks>
+    /// <summary>Tracks the loot table each spawned resource node rolls when harvested.</summary>
+    private readonly Dictionary<int, string> _nodeLootTables = [];
+
+    /// <summary>The marker voxel anchoring each node, so harvesting can clear it again.</summary>
+    private readonly Dictionary<int, (int X, int Y, int Z)> _nodeVoxels = [];
+
+    /// <summary>
+    /// Spawn a harvestable resource node next to the player — the /ore command.
+    /// </summary>
+    /// <remarks>
+    /// Uses the <c>Tree</c> entity, which build 10414 already has. Later builds add dedicated ore
+    /// nodes (<c>TreeMetalOre</c>, <c>TreeKeystoneOre</c>) but they are the same entity shape with
+    /// a different <c>treetype</c>, so a Tree carrying an ore loot table exercises the real
+    /// harvest path on the client we target. The node looks like a tree; only its loot is ore.
+    /// </remarks>
+    public string SpawnResourceNode(string lootTableName)
+    {
+        if (!GeoDataManager.TryGetLootTable(lootTableName, out var table))
+            return $"unknown loot table '{lootTableName}'";
+
+        if (!Map.TryCreateEntity("Tree", out var node))
+            return "could not create the Tree entity";
+
+        if (node.TryGetComponent<ClientTreeComponent>(out var tree))
+            tree.TrunkLootTable = Util.ComputeCrc32(table.Name);
+
+        var placed = "at origin";
+
+        if (Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform) &&
+            TryGetTransform(node, out var transform))
+        {
+            var position = playerTransform.Position;
+            var yawRadians = FacingYawDegrees * MathF.PI / 180f;
+
+            // Two voxels ahead, close enough to hit without walking.
+            const int distance = 2 * VoxelUnits;
+
+            var forwardX = (int)MathF.Round(MathF.Sin(yawRadians) * distance);
+            var forwardZ = (int)MathF.Round(MathF.Cos(yawRadians) * distance);
+
+            transform.Position = new Vector<int>(
+                [position[0] + forwardX, position[1], position[2] + forwardZ, 0, 0, 0, 0, 0]);
+
+            placed = $"at ({transform.Position[0]},{transform.Position[1]},{transform.Position[2]})";
+        }
+
+        // NOTE: the anchor voxel is deliberately NOT placed. FUN_00846960 shows the client
+        // grows a tree from its own part list and checks every part against the voxel already in
+        // the world ("Expected a tree voxel (%d), but got %d"), so a single marker is not enough
+        // — and writing one only punches an invisible hole in the ground. Rendering needs the
+        // treetype's part data from TreeList/TreePartList in the .pc archives.
+
+        Send(new EntityAdd
+        {
+            Id = node.Id,
+            NameHash = Util.ComputeCrc32(node.Name),
+            SyncData = node.GetSyncData(newEntity: true)
+        });
+
+        _nodeLootTables[node.Id] = table.Name;
+
+        Console.WriteLine($"[node] Tree {node.Id} {placed} loot {table.Name}");
+
+        return $"spawned a resource node {placed} dropping {table.Name}";
+    }
+
+    /// <summary>
+    /// Harvest a spawned resource node: roll its loot table, drop the results at its feet and
+    /// remove it. Returns false when the entity is not one of ours.
+    /// </summary>
+    public bool HarvestResourceNode(int entityId)
+    {
+        if (!_nodeLootTables.TryGetValue(entityId, out var tableName) ||
+            !Map.TryGetEntity(entityId, out var node))
+            return false;
+
+        var (dropX, dropY, dropZ) = (0, 0, 0);
+
+        if (TryGetTransform(node, out var transform))
+        {
+            dropX = transform.Position[0];
+            dropY = transform.Position[1];
+            dropZ = transform.Position[2];
+        }
+
+        foreach (var (name, count) in LootTables.Roll(tableName, _loot))
+        {
+            Console.WriteLine($"[node] harvested {entityId} -> {tableName} -> {name} x{count}");
+
+            DropPickup(name, count, dropX, dropY, dropZ);
+        }
+
+        _nodeLootTables.Remove(entityId);
+
+        // Take the anchor voxel away too, or the client keeps drawing the tree.
+        if (_nodeVoxels.Remove(entityId, out var voxel))
+        {
+            Map.VoxelEdits[voxel] = Air;
+
+            SendWorldVoxel(voxel.X, voxel.Y, voxel.Z, Air);
+        }
+
+        Map.RemoveEntity(node);
+        Send(new EntityRemoved { Id = entityId });
+
+        return true;
+    }
+
+    /// <summary>
+    /// Collect a floor pickup into the rucksack — the server side of the client's
+    /// <c>ResourcePickupAction</c>, which it fires when the player walks over or clicks a drop.
+    /// </summary>
+    /// <remarks>
+    /// The Pickup entity is only a wrapper; the item entity it points at is the thing that goes
+    /// into a slot. That entity is already known to the client, so it just needs a slot pointed
+    /// at it — no EntityAdd, unlike <see cref="GiveItem"/>. Stacking into an existing pile is
+    /// tried first so collecting dirt reads as "+1" rather than filling a fresh slot each time,
+    /// which is what the client does with its own drops.
+    ///
+    /// The Pickup is removed either way. Leaving it alive would let the same drop be collected
+    /// repeatedly, since the client keeps firing the action while the player stands on it — the
+    /// log shows a dozen of them for a single item.
+    /// </remarks>
+    public bool CollectPickup(int pickupEntityId)
+    {
+        if (!Map.TryGetEntity(pickupEntityId, out var pickup) ||
+            !pickup.TryGetComponent<ClientResourcePickupComponent>(out var pickupComponent))
+            return false;
+
+        var itemId = pickupComponent.InventoryItemEntity;
+
+        if (!Player.TryGetComponent<ClientInventoryComponent>(out var inventory) ||
+            !Map.TryGetEntity(itemId, out var item) ||
+            !item.TryGetComponent<InventoryItemComponent>(out var itemComponent))
+            return false;
+
+        var slots = inventory.InventoryEntityList;
+        var data = itemComponent.InventorySlotData;
+
+        var collected = false;
+
+        // Merge into a matching stack that still has room.
+        if (data.Name is { } nameHash && GeoDataManager.TryGetResource(nameHash, out var resource))
+        {
+            var limit = StackLimit(resource);
+
+            for (var i = FirstRucksackSlot; i < slots.Count && !collected; i++)
+            {
+                if (slots[i] == 0 ||
+                    !Map.TryGetEntity(slots[i], out var existing) ||
+                    !existing.TryGetComponent<InventoryItemComponent>(out var existingItem))
+                    continue;
+
+                var existingData = existingItem.InventorySlotData;
+
+                if (existingData.Name != nameHash || existingData.Count + data.Count > limit)
+                    continue;
+
+                existingData.Count += data.Count;
+
+                // Reassign so the setter raises the change and the stack syncs.
+                existingItem.InventorySlotData = existingData;
+
+                // The item entity is now redundant — the stack it merged into carries the count.
+                Map.RemoveEntity(item);
+                Send(new EntityRemoved { Id = itemId });
+
+                collected = true;
+
+                Console.WriteLine($"[pickup] {resource.Name} x{data.Count} merged into slot {i}");
+            }
+        }
+
+        // Otherwise it needs a slot of its own.
+        if (!collected)
+        {
+            var slot = -1;
+
+            for (var i = FirstRucksackSlot; i < slots.Count; i++)
+            {
+                if (slots[i] == 0)
+                {
+                    slot = i;
+                    break;
+                }
+            }
+
+            if (slot < 0)
+            {
+                Console.WriteLine("[pickup] rucksack is full; leaving the drop on the floor");
+
+                return false;
+            }
+
+            slots[slot] = itemId;
+
+            // Reassign so the setter raises the change and the next tick syncs the inventory.
+            inventory.InventoryEntityList = slots;
+
+            Console.WriteLine($"[pickup] item {itemId} -> rucksack slot {slot}");
+        }
+
+        Map.RemoveEntity(pickup);
+        Send(new EntityRemoved { Id = pickupEntityId });
+
+        return true;
+    }
+
+    /// <summary>
+    /// Drop a resource a few voxels in front of the player — the /drop admin command, and the
+    /// quickest way to exercise the pickup path without breaking anything.
+    /// </summary>
+    public string DropPickupInFront(string itemName, int count)
+    {
+        if (!Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform))
+            return "player has no transform yet";
+
+        var position = playerTransform.Position;
+        var yawRadians = FacingYawDegrees * MathF.PI / 180f;
+
+        // Position units are 1/32 of a voxel; forward in the XZ plane is (sin, cos).
+        const int distance = 2 * 32;
+
+        var forwardX = (int)MathF.Round(MathF.Sin(yawRadians) * distance);
+        var forwardZ = (int)MathF.Round(MathF.Cos(yawRadians) * distance);
+
+        return DropPickup(itemName, count, position[0] + forwardX, position[1], position[2] + forwardZ);
+    }
+
+    public string DropPickup(string itemName, int count, int worldX, int worldY, int worldZ)
+    {
+        if (!GeoDataManager.TryGetResource(itemName, out var resource))
+            return $"unknown item '{itemName}'";
+
+        if (!Map.TryCreateEntity("BasicInventoryItem", out var item))
+            return "could not create the item entity";
+
+        if (item.TryGetComponent<InventoryItemComponent>(out var inventoryItemComponent))
+        {
+            inventoryItemComponent.InventorySlotData.Name = resource.NameHash;
+            inventoryItemComponent.InventorySlotData.Count = count;
+            inventoryItemComponent.InventorySlotData.ItemUUID = Util.NewGuid();
+        }
+
+        Send(new EntityAdd
+        {
+            Id = item.Id,
+            NameHash = Util.ComputeCrc32(item.Name),
+            SyncData = item.GetSyncData(newEntity: true)
+        });
+
+        if (!Map.TryCreateEntity("Pickup", out var pickup))
+            return "could not create the pickup entity";
+
+        if (pickup.TryGetComponent<ClientResourcePickupComponent>(out var pickupComponent))
+        {
+            var position = new Vector<int>([worldX, worldY, worldZ, 0, 0, 0, 0, 0]);
+
+            pickupComponent.InventoryItemEntity = item.Id;
+            pickupComponent.PickupEnabled = true;
+            pickupComponent.StartPosition = position;
+            pickupComponent.TargetPosition = position;
+        }
+
+        Send(new EntityAdd
+        {
+            Id = pickup.Id,
+            NameHash = Util.ComputeCrc32(pickup.Name),
+            SyncData = pickup.GetSyncData(newEntity: true)
+        });
+
+        ItemNames[item.Id] = resource.Name;
+
+        Console.WriteLine($"[drop] {resource.Name} x{count} at ({worldX},{worldY},{worldZ}) " +
+                          $"item={item.Id} pickup={pickup.Id}");
+
+        return $"dropped {resource.Name} x{count} at ({worldX},{worldY},{worldZ})";
+    }
+
+    /// <summary>
     /// Spawn a world entity by its <c>Entities.json</c> name, a few voxels in front of the
     /// player (the /spawn admin command). Uses the player's live position and facing, both
     /// tracked from <see cref="Packets.EntityMoved"/>. Explicit x/y/z can come later.
@@ -482,14 +772,10 @@ public class Connection
     /// </summary>
     public string SpawnEntity(string name, bool minimal = false)
     {
-        // Voxel blocks hang the client (see EntityManager.IsVoxelLinked) and then poison the
-        // map for every later connection, so refuse rather than spawn a broken one. `minimal`
-        // is the diagnostic escape hatch: it syncs ONLY the parameters we explicitly set
-        // (position) instead of every parameter our components own, which tells us whether a
-        // block hangs because of a value we send or because `voxels` is missing entirely.
-        if (EntityManager.IsVoxelLinked(name) && !minimal)
-            return $"'{name}' is a voxel block (needs clientvoxellinkcomponent); not supported yet";
-
+        // The old refusal of voxel-linked entities is gone: ClientVoxelLinkComponent is
+        // implemented, so `voxels` is sent and these spawn like anything else. `minimal` remains
+        // the diagnostic escape hatch — it syncs ONLY what we explicitly set (position) rather
+        // than every parameter our components own.
         if (!Map.TryCreateEntity(name, out var entity))
             return $"unknown entity '{name}'";
 
@@ -520,6 +806,46 @@ public class Connection
             placed = $"at ({transform.Position[0]}, {transform.Position[1]}, {transform.Position[2]}) yaw {FacingYawDegrees:0}";
         }
 
+        if (!minimal)
+        {
+            // Anything voxel-linked needs its anchor voxels, or it is a mesh floating outside
+            // the world grid. The shape comes from the entity's own Entities.json default.
+            if (entity.TryGetComponent<ClientVoxelLinkComponent>(out var voxelLink))
+            {
+                voxelLink.Voxels = EntityManager.GetDefaultVoxelLinks(entity.Name);
+                voxelLink.CanReplaceVoxelsOfEntityID = 0;
+            }
+
+            // Give every interactable the same baseline the chest needed: enabled, openable by
+            // anyone, and an owner string that is a real uuid rather than a null.
+            if (entity.TryGetComponent<ClientInteractionComponent>(out var interaction))
+            {
+                interaction.Enabled = true;
+                interaction.OwnerOnly = false;
+                interaction.AllowMultipleUsers = true;
+                interaction.HasBeenOpened = false;
+            }
+
+            if (entity.TryGetComponent<ClientOwnerComponent>(out var owner))
+                owner.Owner = Util.CharacterUuid();
+
+            if (entity.TryGetComponent<ClientPickupComponent>(out var pickup))
+            {
+                pickup.InventoryItemEntity = 0;
+                pickup.PlacedByUUID = Util.CharacterUuid();
+                pickup.OnlyOwnerCanPickup = true;
+                pickup.CanPickUpPopulatedInventories = false;
+            }
+
+            var unsendable = entity.DescribeSync().Where(x => !x.Supported).ToList();
+
+            if (unsendable.Count > 0)
+            {
+                Console.WriteLine($"[spawn] {entity.Name}: {unsendable.Count} parameter(s) cannot be sent: "
+                    + string.Join(", ", unsendable.Select(x => $"{x.Parameter} ({x.Component})")));
+            }
+        }
+
         // newEntity: true syncs every parameter our components own (defaults included);
         // false syncs only what changed above, i.e. just the transform.
         Send(new EntityAdd
@@ -535,15 +861,245 @@ public class Connection
     }
 
     /// <summary>
-    /// Spawn a loot chest in front of the player (the /chest admin command). With no
-    /// <paramref name="loot"/> the chest is empty, which is the minimal case for isolating
-    /// what the client dislikes: a bare Chest exercises only the interaction/transform sync,
-    /// while loot additionally exercises the inventory list. Must run on the game thread.
+    /// Close the container the player has open once they walk away from it.
     /// </summary>
-    public string SpawnChest(IReadOnlyList<(string Name, int Count)> loot)
+    /// <remarks>
+    /// The client sends <b>nothing</b> when the loot window is dismissed with Escape or the
+    /// close button — the only packets around a close are <c>SetPlayerState</c> and
+    /// <c>SetLookAtDirection</c>. So the server cannot be told; it has to notice. Without this
+    /// the player's <c>usingentityid</c> stays pointing at the chest after the window is gone,
+    /// the lid stays open, and the next E press is read as the close half of the toggle.
+    ///
+    /// Called from <see cref="Packets.EntityMoved"/> on every position update.
+    /// </remarks>
+    public void UpdateContainerRange()
     {
-        if (!Map.TryCreateEntity("Chest", out var chest))
-            return "could not create the chest entity";
+        if (!Player.TryGetComponent<ClientUseEntityComponent>(out var useEntity)
+            || useEntity.UsingEntityID == 0)
+            return;
+
+        if (!Map.TryGetEntity(useEntity.UsingEntityID, out var target)
+            || !TryGetTransform(target, out var targetTransform)
+            || !Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform))
+            return;
+
+        var dx = playerTransform.Position[0] - targetTransform.Position[0];
+        var dy = playerTransform.Position[1] - targetTransform.Position[1];
+        var dz = playerTransform.Position[2] - targetTransform.Position[2];
+
+        var distanceSquared = (long)dx * dx + (long)dy * dy + (long)dz * dz;
+
+        if (distanceSquared <= (long)ContainerRange * ContainerRange)
+            return;
+
+        Console.WriteLine($"[interact] out of range of '{target.Name}' ({useEntity.UsingEntityID}) "
+            + $"at {Math.Sqrt(distanceSquared):F0} units — closing");
+
+        useEntity.UsingEntityID = 0;
+
+        // Shuts the lid; see OpenInteractable for why this is the close signal.
+        if (target.TryGetComponent<ClientInteractionComponent>(out var interaction))
+            interaction.HasBeenOpened = true;
+    }
+
+    /// <summary>
+    /// How far the player may stray before an open container closes itself. `/chest` places a
+    /// chest <c>3 * 32</c> units ahead, so this is a few chest-lengths — deliberately generous,
+    /// since the position units in this codebase are inconsistent (32 here, `VoxelUnits` = 64
+    /// elsewhere) and closing the window while the player is still standing at the chest would
+    /// be far worse than closing it a little late.
+    /// </summary>
+    private const int ContainerRange = 400;
+
+    /// <summary>
+    /// Resolve any entity's inventory by id — the player's own bag, or an open container's.
+    /// </summary>
+    /// <remarks>
+    /// Inventory drags carry a source and a target entity id, which are equal for a move inside
+    /// the rucksack and differ when moving to or from a chest. Both handlers used to bail out
+    /// unless each id was the player, so container transfers did nothing; that guard was only
+    /// ever reachable once chests could be opened at all.
+    /// </remarks>
+    public bool TryGetInventory(int entityId, [NotNullWhen(true)] out ClientInventoryComponent? inventory)
+    {
+        inventory = null;
+
+        if (entityId == Player.Id)
+            return Player.TryGetComponent(out inventory);
+
+        return Map.TryGetEntity(entityId, out var entity) && entity.TryGetComponent(out inventory);
+    }
+
+    /// <summary>
+    /// Move a stack between two <em>different</em> inventories (chest to bag, or back), swapping
+    /// when the destination square is occupied. Same-inventory drags keep using the split/merge
+    /// path in <see cref="Packets.InventoryItemTransferToSlot"/>.
+    /// </summary>
+    public bool TryTransferBetweenInventories(
+        ClientInventoryComponent source, int sourceSlot,
+        ClientInventoryComponent target, int targetSlot, int count = 0)
+    {
+        var sourceSlots = source.InventoryEntityList;
+        var targetSlots = target.InventoryEntityList;
+
+        if (sourceSlot < 0 || sourceSlot >= sourceSlots.Count ||
+            targetSlot < 0 || targetSlot >= targetSlots.Count)
+        {
+            Console.WriteLine($"[inventory] cross-container slot out of range "
+                + $"(source has {sourceSlots.Count}, target {targetSlots.Count})");
+
+            return false;
+        }
+
+        if (sourceSlots[sourceSlot] == 0)
+            return false;
+
+        // Dropping a partial stack onto an empty square is a split, and dropping onto a
+        // matching stack is a merge — exactly as inside one inventory. Without these two the
+        // transfer moved the whole item entity regardless of the count the client asked for,
+        // so dragging 5 of 10 into a chest silently moved all 10.
+        if (TrySplitStack(sourceSlot, targetSlot, count, source, target))
+            return true;
+
+        if (TryMergeStack(sourceSlot, targetSlot, count, source, target))
+            return true;
+
+        (sourceSlots[sourceSlot], targetSlots[targetSlot]) = (targetSlots[targetSlot], sourceSlots[sourceSlot]);
+
+        // Reassign both: mutating the list in place does not run the setter that marks the
+        // parameter dirty, so neither entity would sync.
+        source.InventoryEntityList = sourceSlots;
+        target.InventoryEntityList = targetSlots;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Move every stack from one inventory into the first free squares of another — the loot
+    /// window's "Take All" button.
+    /// </summary>
+    /// <remarks>
+    /// The client sends <c>InventoryItemTransferAll</c> (52) carrying just the two entity ids;
+    /// it applies nothing locally and waits for the inventory sync, so an unhandled packet
+    /// leaves the button looking dead.
+    /// </remarks>
+    public int TransferAll(ClientInventoryComponent source, ClientInventoryComponent target)
+    {
+        var moved = 0;
+
+        for (var slot = 0; slot < source.InventoryEntityList.Count; slot++)
+        {
+            if (source.InventoryEntityList[slot] == 0)
+                continue;
+
+            // Prefer topping up a matching stack, then fall back to the first empty square.
+            var merged = false;
+
+            for (var candidate = 0; candidate < target.InventoryEntityList.Count && !merged; candidate++)
+            {
+                if (target.InventoryEntityList[candidate] == 0)
+                    continue;
+
+                merged = TryMergeStack(slot, candidate, 0, source, target);
+            }
+
+            if (merged)
+            {
+                moved++;
+
+                continue;
+            }
+
+            var free = target.InventoryEntityList.IndexOf(0);
+
+            // Into the rucksack proper, never the equipment or hotbar squares.
+            if (ReferenceEquals(target, PlayerInventory) && free < FirstRucksackSlot)
+                free = target.InventoryEntityList.FindIndex(FirstRucksackSlot, id => id == 0);
+
+            if (free < 0)
+                break;
+
+            if (TryTransferBetweenInventories(source, slot, target, free))
+                moved++;
+        }
+
+        return moved;
+    }
+
+    /// <summary>The player's own inventory, or null if they somehow have none.</summary>
+    private ClientInventoryComponent? PlayerInventory =>
+        Player.TryGetComponent<ClientInventoryComponent>(out var inventory) ? inventory : null;
+
+    /// <summary>
+    /// Answer an <c>InteractAction</c> by opening the target container.
+    /// </summary>
+    /// <remarks>
+    /// There is no "open the chest" packet. The client opens a loot window when the
+    /// <em>player's</em> <c>usingentityid</c> becomes the target's entity id — see
+    /// <see cref="UseEntityComponent"/> for the decompiled chain. Setting it marks the
+    /// parameter dirty and <c>Server.ProcessMaps</c> fans the <c>EntitySync</c> out.
+    ///
+    /// <c>hasbeenopened</c> must stay <b>false</b>. It is the close signal, not the open one:
+    /// the client's open path <c>FUN_00778ac0</c> fires event <c>0x4E</c> only when
+    /// <c>islootchest &amp;&amp; !hasbeenopened</c>, while <c>FUN_00778af0</c> fires the close event
+    /// <c>0x4F</c> when it flips true. An earlier version of this method set it true on every
+    /// interact, which was both the wrong signal and a permanent poison of the open path.
+    /// </remarks>
+    public void OpenInteractable(int entityId)
+    {
+        if (!Map.TryGetEntity(entityId, out var entity))
+        {
+            Console.WriteLine($"[interact] entity {entityId} is not on the map");
+
+            return;
+        }
+
+        if (!entity.TryGetComponent<ClientInteractionComponent>(out var interaction))
+        {
+            Console.WriteLine($"[interact] '{entity.Name}' ({entityId}) has no ClientInteractionComponent");
+
+            return;
+        }
+
+        if (!Player.TryGetComponent<ClientUseEntityComponent>(out var useEntity))
+        {
+            Console.WriteLine("[interact] the player has no ClientUseEntityComponent");
+
+            return;
+        }
+
+        var slots = entity.TryGetComponent<ClientInventoryComponent>(out var inventory)
+            ? $"{inventory.InventoryEntityList.Count(id => id != 0)}/{inventory.MaxInventorySlots} filled"
+            : "no inventory component";
+
+        // Toggle: pressing E on the chest we already have open closes it.
+        var opening = useEntity.UsingEntityID != entityId;
+
+        useEntity.UsingEntityID = opening ? entityId : 0;
+
+        // The lid animation is driven by hasbeenopened, not by usingentityid. FUN_00778af0
+        // fires the close event 0x4F only on the false -> true transition (while the client's
+        // own "window open" latch is set), and the open path FUN_00778ac0 requires it to be
+        // false. So it has to be raised to shut the lid and lowered again before the next open,
+        // which is safe here because the two happen on separate key presses and therefore in
+        // different sync ticks.
+        interaction.HasBeenOpened = !opening;
+
+        Console.WriteLine($"[interact] {(opening ? "opening" : "closing")} '{entity.Name}' ({entityId}): {slots}; "
+            + $"enabled={interaction.Enabled} islootchest={interaction.IsLootChest} "
+            + $"hasbeenopened={interaction.HasBeenOpened} -> player usingentityid={useEntity.UsingEntityID}");
+    }
+
+    /// <summary>
+    /// Spawn a loot chest in front of the player (the /chest admin command). With no
+    /// <paramref name="loot"/> the chest is empty. Also serves as the generic "spawn an
+    /// interactable" path — pass <paramref name="entityName"/> to place an Anvil, a Mailbox or
+    /// any other entity carrying <c>clientinteractioncomponent</c>. Must run on the game thread.
+    /// </summary>
+    public string SpawnChest(IReadOnlyList<(string Name, int Count)> loot, string entityName = "Chest")
+    {
+        if (!Map.TryCreateEntity(entityName, out var chest))
+            return $"could not create the '{entityName}' entity";
 
         if (Player.TryGetComponent<SmoothedTransformComponent>(out var playerTransform) &&
             TryGetTransform(chest, out var transform))
@@ -586,6 +1142,33 @@ public class Connection
             interaction.HasBeenOpened = false;
         }
 
+        // The voxel link is what puts the chest *in* the world grid rather than floating in
+        // front of it. Every one of the 50 entities that declares clientinteractioncomponent
+        // also declares this, and until now we had no class for it, so `voxels` was never sent.
+        // Entities.json gives the shape per entity: Chest is [[[0,0,0], 39]] - a single voxel at
+        // the entity's own cell, index 39 being the voxel literally named `Entity`. Read it from
+        // the entity data rather than hardcoding, so PVP_Post's 3-tall stack works too.
+        // Pickup is the branch the HUD falls back to when the interact branch declines — which
+        // for a Chest happens whenever the player is outside its 45-degree interaction cone,
+        // i.e. standing behind it. Unsent, the client had nothing to describe the pickup with
+        // and showed "Inventory Full". Values follow Entities.json: a populated loot chest is
+        // not baggable, and only whoever placed it may take it.
+        if (chest.TryGetComponent<ClientPickupComponent>(out var pickup))
+        {
+            pickup.InventoryItemEntity = 0;
+            pickup.PlacedByUUID = Util.CharacterUuid();
+            pickup.OnlyOwnerCanPickup = true;
+            pickup.CanPickUpPopulatedInventories = false;
+        }
+
+        if (chest.TryGetComponent<ClientVoxelLinkComponent>(out var voxelLink))
+        {
+            voxelLink.Voxels = EntityManager.GetDefaultVoxelLinks(chest.Name);
+            voxelLink.CanReplaceVoxelsOfEntityID = 0;
+
+            Console.WriteLine($"[chest] voxel link: {string.Join(" ", voxelLink.Voxels.Select(v => $"({v.X},{v.Y},{v.Z})={v.VoxelIndex}"))}");
+        }
+
         const int slots = 25;
 
         var placed = 0;
@@ -598,7 +1181,10 @@ public class Connection
             var contents = new List<int>(new int[slots]);
 
             inventory.MaxInventorySlots = slots;
-            inventory.TakeOnly = true;
+            // false = a proper two-way storage chest. TakeOnly is the authentic setting for a
+            // one-shot loot chest, but it also stops the client letting you put anything back,
+            // which makes the container useless for testing transfers in both directions.
+            inventory.TakeOnly = false;
 
             var slot = 0;
 
@@ -652,7 +1238,21 @@ public class Connection
             SyncData = chest.GetSyncData(newEntity: true)
         });
 
-        Console.WriteLine($"[chest] spawned (id {chest.Id}) with {placed} item(s)");
+        var sync = chest.DescribeSync().ToList();
+
+        var unsendable = sync.Where(x => !x.Supported).ToList();
+
+        Console.WriteLine($"[chest] spawned '{chest.Name}' (id {chest.Id}) with {placed} item(s), "
+            + $"{sync.Count} synced parameters");
+
+        foreach (var (index, component, parameter, supported) in sync)
+            Console.WriteLine($"[chest]   {index,2} {parameter,-32} {component,-32} {(supported ? "sent" : "NOT SENT - no server component")}");
+
+        if (unsendable.Count > 0)
+        {
+            Console.WriteLine($"[chest] {unsendable.Count} parameter(s) cannot be sent: "
+                + string.Join(", ", unsendable.Select(x => x.Parameter)));
+        }
 
         return $"spawned loot chest (id {chest.Id}) with {placed} item(s)";
     }
@@ -751,19 +1351,30 @@ public class Connection
     /// <see cref="InventoryItemComponent"/>, so splitting means shrinking that entity's count
     /// and creating a second entity for the remainder.
     /// </remarks>
-    public bool TrySplitStack(int sourceSlot, int targetSlot, int count)
+    /// <param name="inventory">
+    /// Which inventory to operate on; null means the player's own bag. A chest passes its own,
+    /// so rearranging and splitting stacks *inside* a container works the same way it does in
+    /// the rucksack.
+    /// </param>
+    public bool TrySplitStack(int sourceSlot, int targetSlot, int count,
+        ClientInventoryComponent? inventory = null, ClientInventoryComponent? targetInventory = null)
     {
-        if (!Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+        if (inventory is null && !Player.TryGetComponent(out inventory))
             return false;
 
-        var slots = inventory.InventoryEntityList;
+        // Same inventory unless told otherwise, which makes a cross-container split — dragging
+        // half a stack straight from the chest into the rucksack — the same operation.
+        targetInventory ??= inventory;
 
-        if (sourceSlot < 0 || sourceSlot >= slots.Count || targetSlot < 0 || targetSlot >= slots.Count)
+        var slots = inventory.InventoryEntityList;
+        var targetSlots = targetInventory.InventoryEntityList;
+
+        if (sourceSlot < 0 || sourceSlot >= slots.Count || targetSlot < 0 || targetSlot >= targetSlots.Count)
             return false;
 
         // Only ever split into an empty square; merging into an occupied one is a different
         // operation and would need the stack limit checking.
-        if (slots[targetSlot] != 0 || slots[sourceSlot] == 0)
+        if (targetSlots[targetSlot] != 0 || slots[sourceSlot] == 0)
             return false;
 
         if (!Map.TryGetEntity(slots[sourceSlot], out var source) ||
@@ -799,8 +1410,10 @@ public class Connection
             SyncData = item.GetSyncData(newEntity: true)
         });
 
-        slots[targetSlot] = item.Id;
+        targetSlots[targetSlot] = item.Id;
 
+        // Reassign both; when the two are the same object this is simply done twice.
+        targetInventory.InventoryEntityList = targetSlots;
         inventory.InventoryEntityList = slots;
 
         if (ItemNames.TryGetValue(source.Id, out var itemName))
@@ -967,7 +1580,8 @@ public class Connection
     /// A dig tick on one voxel. Once enough ticks land the voxel is removed from the world,
     /// the change is pushed to the client, and its material's item goes into the rucksack.
     /// </summary>
-    public string? Dig(int chunkX, int chunkY, int chunkZ, int voxelX, int voxelY, int voxelZ)
+    public string? Dig(int chunkX, int chunkY, int chunkZ, int voxelX, int voxelY, int voxelZ,
+        int hitX = 0, int hitY = 0, int hitZ = 0)
     {
         const int chunkSize = TerrainGenerator.ChunkSize;
 
@@ -993,6 +1607,44 @@ public class Connection
         Map.VoxelEdits[world] = Air;
 
         SendVoxelEdit(chunkX, chunkY, chunkZ, voxelX, voxelY, voxelZ, Air);
+
+        // Ore rolls a loot table and pops out as a floor pickup, the way seams do in the real
+        // game. Everything else goes straight into the rucksack, matching what plain blocks do.
+        if (LootTables.TableFor(material) is { } tableName)
+        {
+            var rolled = LootTables.Roll(tableName, _loot);
+
+            if (rolled.Count == 0)
+            {
+                Console.WriteLine($"[dig] broke voxel ({world.X},{world.Y},{world.Z}) -> {tableName} rolled nothing");
+
+                return null;
+            }
+
+            // Drop where the block was. The dig packet carries the exact point the tool
+            // struck in entity units (1/64 of a voxel), so no conversion is needed — and it is
+            // the only coordinate here that is guaranteed to agree with the client's own.
+            var dropX = hitX;
+            var dropY = hitY;
+            var dropZ = hitZ;
+
+            // Fall back to the block's centre if the packet had no hit point.
+            if (dropX == 0 && dropY == 0 && dropZ == 0)
+            {
+                dropX = world.X * VoxelUnits + VoxelUnits / 2;
+                dropY = world.Y * VoxelUnits + VoxelUnits / 2;
+                dropZ = world.Z * VoxelUnits + VoxelUnits / 2;
+            }
+
+            foreach (var (name, count) in rolled)
+            {
+                Console.WriteLine($"[dig] broke voxel ({world.X},{world.Y},{world.Z}) -> {tableName} -> {name} x{count}");
+
+                DropPickup(name, count, dropX, dropY, dropZ);
+            }
+
+            return rolled[0].Name;
+        }
 
         var loot = TerrainGenerator.LootFor(material);
 
@@ -1038,6 +1690,24 @@ public class Connection
         SendVoxelEdit(chunkX, chunkY, chunkZ, voxelX, voxelY, voxelZ, value);
     }
 
+    /// <summary>
+    /// Push a voxel change to this client. The admin editor records the edit on the world
+    /// itself and calls this so the running game reflects it, exactly as digging and placing do.
+    /// </summary>
+    public void SendWorldVoxel(int worldX, int worldY, int worldZ, byte material)
+    {
+        const int chunkSize = TerrainGenerator.ChunkSize;
+
+        // Floor division so negative coordinates land in the right chunk.
+        var chunkX = (int)Math.Floor(worldX / (double)chunkSize);
+        var chunkY = (int)Math.Floor(worldY / (double)chunkSize);
+        var chunkZ = (int)Math.Floor(worldZ / (double)chunkSize);
+
+        SendVoxelEdit(chunkX, chunkY, chunkZ,
+            worldX - chunkX * chunkSize, worldY - chunkY * chunkSize, worldZ - chunkZ * chunkSize,
+            material);
+    }
+
     /// <summary>Air, matching the generator and the wire format.</summary>
     private const byte Air = byte.MaxValue;
 
@@ -1071,6 +1741,16 @@ public class Connection
     /// everything else, blocks included, uses this. 64 matches the point at which
     /// <see cref="Packets.Common.InventorySlotData"/> switches to its wide count encoding.
     /// </summary>
+    /// <summary>Rolls for loot tables. One per connection keeps digs reproducible-ish.</summary>
+    private readonly Random _loot = new();
+
+    /// <summary>
+    /// Entity position units per voxel. Confirmed by the dig packet, whose position field
+    /// is documented as <c>/ 64</c> — an earlier value of 32 put drops at half scale,
+    /// underground and invisible.
+    /// </summary>
+    private const int VoxelUnits = 64;
+
     private const int DefaultStackLimit = 64;
 
     private static int StackLimit(ResourceData resource)
@@ -1083,22 +1763,33 @@ public class Connection
     /// the stack limit. Returns false when this is not a merge (different items, empty target,
     /// no room), leaving the caller to swap instead.
     /// </summary>
-    public bool TryMergeStack(int sourceSlot, int targetSlot, int count)
+    /// <param name="inventory">
+    /// Which inventory to operate on; null means the player's own bag. See
+    /// <see cref="TrySplitStack"/>.
+    /// </param>
+    public bool TryMergeStack(int sourceSlot, int targetSlot, int count,
+        ClientInventoryComponent? inventory = null, ClientInventoryComponent? targetInventory = null)
     {
-        if (!Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+        if (inventory is null && !Player.TryGetComponent(out inventory))
             return false;
 
-        var slots = inventory.InventoryEntityList;
+        // Same inventory unless told otherwise; passing a second one merges a rucksack stack
+        // onto a matching stack already in the chest, and vice versa.
+        targetInventory ??= inventory;
 
-        if (sourceSlot == targetSlot ||
+        var slots = inventory.InventoryEntityList;
+        var targetSlots = targetInventory.InventoryEntityList;
+
+        // A slot can only collide with itself within one inventory.
+        if ((sourceSlot == targetSlot && ReferenceEquals(inventory, targetInventory)) ||
             sourceSlot < 0 || sourceSlot >= slots.Count ||
-            targetSlot < 0 || targetSlot >= slots.Count ||
-            slots[sourceSlot] == 0 || slots[targetSlot] == 0)
+            targetSlot < 0 || targetSlot >= targetSlots.Count ||
+            slots[sourceSlot] == 0 || targetSlots[targetSlot] == 0)
             return false;
 
         if (!Map.TryGetEntity(slots[sourceSlot], out var source) ||
             !source.TryGetComponent<InventoryItemComponent>(out var sourceItem) ||
-            !Map.TryGetEntity(slots[targetSlot], out var target) ||
+            !Map.TryGetEntity(targetSlots[targetSlot], out var target) ||
             !target.TryGetComponent<InventoryItemComponent>(out var targetItem))
             return false;
 

@@ -47,6 +47,10 @@ public static class EntityMoved
             // Track the player's facing for /spawn, but NOT via the synced YawDegrees param:
             // syncing yawdegrees back mid-gameplay null-derefs the client (crash eip=0x420a43).
             connection.FacingYawDegrees = yaw;
+
+            // The client tells us nothing when the loot window is dismissed, so walking away is
+            // the only close signal the server can observe.
+            connection.UpdateContainerRange();
         }
 
         return true;

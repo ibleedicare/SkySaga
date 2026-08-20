@@ -42,15 +42,27 @@ public static class InventoryItemSwap
 
         Console.WriteLine($"[inventory] swap {sourceEntityID}:{sourceSlotID} <-> {targetEntityID}:{targetSlotID}");
 
-        // Only the player's own inventory is backed so far; containers come later.
-        if (sourceEntityID != connection.Player.Id || targetEntityID != connection.Player.Id)
+        // A drop onto an occupied square in a container: the entity ids differ. Same-inventory
+        // drops fall through to the merge/swap path below.
+        if (sourceEntityID != targetEntityID)
         {
-            Console.WriteLine("[inventory] swap involves another entity's inventory — ignored");
+            if (!connection.TryGetInventory(sourceEntityID, out var source) ||
+                !connection.TryGetInventory(targetEntityID, out var target))
+            {
+                Console.WriteLine("[inventory] swap involves an entity with no inventory");
+
+                return true;
+            }
+
+            if (connection.TryTransferBetweenInventories(source, sourceSlotID, target, targetSlotID))
+                Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
 
             return true;
         }
 
-        if (!connection.Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+        // Same entity on both sides: a drop within one inventory — the rucksack, or one chest
+        // square onto another. Resolve by id rather than assuming the player.
+        if (!connection.TryGetInventory(sourceEntityID, out var inventory))
             return true;
 
         var slots = inventory.InventoryEntityList;
@@ -67,7 +79,7 @@ public static class InventoryItemSwap
         // exchanging the two. This is the packet the client sends for a drop on an occupied
         // square — InventoryItemTransferToSlot only covers empty ones — so the merge has to
         // live here. Count 0 means "as much of the stack as fits".
-        if (connection.TryMergeStack(sourceSlotID, targetSlotID, 0))
+        if (connection.TryMergeStack(sourceSlotID, targetSlotID, 0, inventory))
         {
             Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
 

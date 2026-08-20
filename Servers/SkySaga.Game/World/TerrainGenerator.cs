@@ -30,10 +30,10 @@ public static class TerrainGenerator
     // Block ids come from Blocks, which resolved them from the client's item CRCs. The
     // previous values here were mislabelled: 24 is Sand, 13 is Wooden_Plank and 14 is Leaf,
     // so the "stone" underground was really planks and leaves.
-    private const byte Air = Blocks.Air;
-    private const byte Sand = Blocks.Sand;
-    private const byte Dirt = Blocks.Dirt;
-    private const byte Stone = Blocks.Stone;
+    private static byte Air => Blocks.Air;
+    private static byte Sand => Blocks.Sand;
+    private static byte Dirt => Blocks.Dirt;
+    private static byte Stone => Blocks.Stone;
 
     public static int Seed { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("SKYSAGA_WORLD_SEED"), out var seed) ? seed : 1337;
@@ -52,6 +52,11 @@ public static class TerrainGenerator
 
         voxels[0] = 0; // raw
 
+        // Start as air rather than leaving zeros to be patched up afterwards: 0 is a real
+        // block id (Dirt), so a "0 means empty" sentinel silently deleted every dirt voxel
+        // and left the world hollow and unlit.
+        Array.Fill(voxels, Air, 1, VoxelsPerChunk);
+
         var solid = false;
 
         for (var h1 = 0; h1 < ChunkSize; h1++)
@@ -61,13 +66,12 @@ public static class TerrainGenerator
                 var worldH1 = chunkZ * ChunkSize + h1;
                 var worldH2 = chunkX * ChunkSize + h2;
 
-                var (surface, floor) = Column(worldH1, worldH2);
-
                 for (var y = 0; y < ChunkSize; y++)
                 {
                     var worldY = chunkY * ChunkSize + y;
 
-                    var material = Material(worldY, surface, floor);
+                    // worldH1 is Z and worldH2 is X - see MaterialAt.
+                    var material = MaterialAt(worldH2, worldY, worldH1);
 
                     if (material == Air)
                         continue;
@@ -82,13 +86,6 @@ public static class TerrainGenerator
         if (!solid)
             return null;
 
-        // The array starts zeroed and 0 is a real block id, so fill the gaps with air.
-        for (var i = 1; i < voxels.Length; i++)
-        {
-            if (voxels[i] == 0)
-                voxels[i] = Air;
-        }
-
         return voxels;
     }
 
@@ -96,6 +93,9 @@ public static class TerrainGenerator
     public static (int X, int Y, int Z) Spawn()
     {
         var centre = SizeChunks * ChunkSize / 2;
+
+        if (PaletteMode)
+            return (centre, PaletteFloor + 3, centre);
 
         var (surface, _) = Column(centre, centre);
 
@@ -112,12 +112,41 @@ public static class TerrainGenerator
     /// </summary>
     public static byte MaterialAt(int worldX, int worldY, int worldZ)
     {
+        if (PaletteMode)
+            return PaletteMaterial(worldX, worldY, worldZ);
+
         // GenerateChunk builds columns as Column(worldH1 = Z, worldH2 = X), so the arguments
         // go in that order here too — passing X,Z reads a different column entirely.
         var (surface, floor) = Column(worldZ, worldX);
 
-        return Material(worldY, surface, floor);
+        return Material(worldX, worldY, worldZ, surface, floor);
     }
+
+    /// <summary>
+    /// SKYSAGA_BLOCK_PALETTE=1 replaces the world with every block id laid out on a floor, so
+    /// unknown blocks can be identified by looking at them: dig one and the server logs which
+    /// id it was. Ids run 0-255 over a repeating 16x16 tile, id = (x % 16) + (z % 16) * 16.
+    /// </summary>
+    public static bool PaletteMode =>
+        Environment.GetEnvironmentVariable("SKYSAGA_BLOCK_PALETTE") == "1";
+
+    private const int PaletteFloor = 16;
+
+    private static byte PaletteMaterial(int worldX, int worldY, int worldZ)
+    {
+        // A slab to stand on, with the samples one layer above it.
+        if (worldY < PaletteFloor)
+            return Stone;
+
+        if (worldY > PaletteFloor)
+            return Air;
+
+        var x = ((worldX % 16) + 16) % 16;
+        var z = ((worldZ % 16) + 16) % 16;
+
+        return (byte)(x + z * 16);
+    }
+
 
     /// <summary>The material an item places, or null for items that are not terrain blocks.</summary>
     public static byte? MaterialFor(string itemName) => Blocks.MaterialFor(itemName);
@@ -138,7 +167,7 @@ public static class TerrainGenerator
         return (surface, Math.Max(0, surface - thickness));
     }
 
-    private static byte Material(int y, int surface, int floor)
+    private static byte Material(int x, int y, int z, int surface, int floor)
     {
         if (y > surface || y < floor)
             return Air;
@@ -147,7 +176,34 @@ public static class TerrainGenerator
         if (y > surface - 4)
             return Sand;
 
-        return y < floor + 3 ? Stone : Dirt;
+        if (y >= floor + 3)
+            return Dirt;
+
+        return Ore(x, y, z) ?? Stone;
+    }
+
+
+    /// <summary>
+    /// Scatters ore deposits through the stone layer so they can actually be mined. Deposits
+    /// are <c>IsPlaceable: false</c> in the client's table — they exist only in terrain, which
+    /// is why none could be found before the generator produced any.
+    /// </summary>
+    private static byte? Ore(int x, int y, int z)
+    {
+        // Deterministic per voxel, and sparse: roughly one voxel in twenty is ore.
+        var roll = Hash(x * 31 + y * 17, z * 13 + y * 7, Seed + 99);
+
+        if (roll > 0.05f)
+            return null;
+
+        // Deeper is rarer and more valuable.
+        return roll switch
+        {
+            < 0.006f => Blocks.GoldDeposit,
+            < 0.016f => Blocks.LeadDeposit,
+            < 0.030f => Blocks.CopperDeposit,
+            _ => Blocks.IronDeposit
+        };
     }
 
     /// <summary>Value noise with a few octaves; deterministic, no allocations.</summary>

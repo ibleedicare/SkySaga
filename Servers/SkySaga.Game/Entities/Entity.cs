@@ -71,6 +71,34 @@ public class Entity
         return true;
     }
 
+    /// <summary>
+    /// Per-synced-parameter report of what this entity can actually put on the wire: the
+    /// declaring component, the parameter, and whether we hold a component that serialises it.
+    /// A parameter whose component we have no class for can never be sent, so its presence bit
+    /// stays clear even under <c>newEntity: true</c> - which is invisible in a packet dump.
+    /// </summary>
+    public IEnumerable<(int Index, string Component, string Parameter, bool Supported)> DescribeSync()
+    {
+        for (var i = 0; i < _entityData.SyncedParametersCount; i++)
+        {
+            if (!_entityData.TryGetSyncedParameterInfo(i, out var componentName, out var parameterName))
+            {
+                yield return (i, "?", "?", false);
+
+                continue;
+            }
+
+            // "Supported" means the bit can actually be set: we must hold the component AND
+            // its TrySync must handle the parameter. Holding the component is not enough -
+            // e.g. ClientInteractionComponent has no branch for interactionanglesradians, so
+            // that bit stays clear even though the component is present.
+            var supported = _components.TryGetValue(componentName, out var component)
+                && component.TrySync(parameterName, new BitStream());
+
+            yield return (i, componentName, parameterName, supported);
+        }
+    }
+
     public BitStream GetSyncData(bool newEntity)
     {
         var bitArray = new BitArray(_entityData.SyncedParametersCount);

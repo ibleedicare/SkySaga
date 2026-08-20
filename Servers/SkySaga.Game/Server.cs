@@ -24,6 +24,12 @@ public class Server : IDisposable
     private readonly RakPeerInterface _peer;
 
     private readonly Dictionary<int, Map> _maps = new();
+
+    /// <summary>
+    /// The world, reachable without a connected player so the admin editor can change terrain
+    /// while nobody is in the game.
+    /// </summary>
+    public Map? World => _maps.TryGetValue(0, out var map) ? map : null;
     private readonly Dictionary<ulong, Connection> _connections = new();
 
     // Work handed in from other threads (the chat/IRC server) to run on the game thread,

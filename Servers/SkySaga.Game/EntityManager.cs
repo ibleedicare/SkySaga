@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -83,7 +84,10 @@ public static class EntityManager
 
                 if (parameterProperty.Value.TryGetPropertyIgnoreCase("Value", out var valueElement))
                 {
-                    parameterInfo.Value = valueElement;
+                    // Clone: a JsonElement is a view into the JsonDocument, which this method
+                    // disposes on the way out. Nothing read Value until GetDefaultVoxelLinks,
+                    // so the dangling reference had never been noticed.
+                    parameterInfo.Value = valueElement.Clone();
                 }
 
                 parameters.Add(parameterInfo);
@@ -158,6 +162,48 @@ public static class EntityManager
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// The <c>voxels</c> default an entity declares in Entities.json, as
+    /// <see cref="VoxelLink"/>s. Shaped <c>[[[x,y,z], voxelIndex], ...]</c> — e.g. <c>Chest</c>
+    /// is <c>[[[0,0,0], 39]]</c> and <c>PVP_Post</c> a 3-tall stack of the same index. Returns
+    /// an empty list when the entity declares no default, which callers must treat as
+    /// "do not send" (an empty list is not representable on the wire — see
+    /// <see cref="VoxelLinkComponent"/>).
+    /// </summary>
+    public static List<VoxelLink> GetDefaultVoxelLinks(string name)
+    {
+        var links = new List<VoxelLink>();
+
+        if (!_entities.TryGetValue(name, out var entityData))
+            return links;
+
+        var parameter = entityData.Parameters
+            .FirstOrDefault(x => x.Name.Equals("voxels", StringComparison.OrdinalIgnoreCase));
+
+        if (parameter is null || parameter.Value.ValueKind != JsonValueKind.Array)
+            return links;
+
+        foreach (var element in parameter.Value.EnumerateArray())
+        {
+            // Each element is [[x, y, z], voxelIndex].
+            if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() != 2)
+                continue;
+
+            var offset = element[0];
+
+            if (offset.ValueKind != JsonValueKind.Array || offset.GetArrayLength() != 3)
+                continue;
+
+            links.Add(new VoxelLink(
+                offset[0].GetInt32(),
+                offset[1].GetInt32(),
+                offset[2].GetInt32(),
+                (byte)element[1].GetInt32()));
+        }
+
+        return links;
     }
 
     public static bool TryCreateEntity(int id, string name, [NotNullWhen(true)] out Entity? entity)

@@ -29,6 +29,7 @@ public static class ExecuteEntityAction
         { Util.ComputeCrc32("BlockAction"), "BlockAction" },
         { Util.ComputeCrc32("BlastRadiusAction"), "BlastRadiusAction" },
         { Util.ComputeCrc32("ResourcePickupAction"), "ResourcePickupAction" },
+        { Util.ComputeCrc32("GatherAction"), "GatherAction" },
     };
 
     public static bool Handle(Connection connection, BitStream bitStream)
@@ -55,6 +56,21 @@ public static class ExecuteEntityAction
         // Release run (E on a loot chest arrives here, not as InteractWithEntity).
         Console.WriteLine($"[action] src {srcEntityID} -> target {targetEntityID} ({target}) "
             + $"action {actionName ?? "unknown"} (crc {(uint)actionCrc})");
+
+        // Walking over a floor drop fires this repeatedly until the Pickup goes away, so
+        // CollectPickup removing the entity is what stops the stream.
+        if (actionName == "ResourcePickupAction")
+            connection.CollectPickup(targetEntityID);
+
+        // Whatever the client calls chopping — Gather, Attack or Dig all reach a tree — treat a
+        // hit on one of our spawned nodes as a harvest.
+        if (actionName is "GatherAction" or "AttackAction" or "DigAction" or "PickupAction")
+            connection.HarvestResourceNode(targetEntityID);
+
+        // E on a loot chest lands here. Until now nothing answered it: the packet was parsed,
+        // logged and dropped, so the client asked to open the container and never heard back.
+        if (actionName == "InteractAction")
+            connection.OpenInteractable(targetEntityID);
 
         return true;
     }

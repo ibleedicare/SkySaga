@@ -105,10 +105,29 @@ public static class InventoryItemTransferToSlot
 
         Console.WriteLine($"[inventory] transfer {sourceEntityId}:{sourceSlot} -> {targetEntityId}:{targetSlot} x{count}");
 
-        if (sourceEntityId != connection.Player.Id || targetEntityId != connection.Player.Id)
-            return true;
+        // Moving to or from an open container: the two entity ids differ. Handled before the
+        // player-only path below, which owns the split/merge behaviour that only makes sense
+        // within a single inventory.
+        if (sourceEntityId != targetEntityId)
+        {
+            if (!connection.TryGetInventory(sourceEntityId, out var source) ||
+                !connection.TryGetInventory(targetEntityId, out var target))
+            {
+                Console.WriteLine("[inventory] transfer involves an entity with no inventory");
 
-        if (!connection.Player.TryGetComponent<ClientInventoryComponent>(out var inventory))
+                return true;
+            }
+
+            if (connection.TryTransferBetweenInventories(source, (int)sourceSlot, target, (int)targetSlot, (int)count))
+                Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
+
+            return true;
+        }
+
+        // Same entity on both sides: a rearrange within one inventory. That is the player's
+        // rucksack most of the time, but it is also how the client moves an item from one chest
+        // square to another, so resolve by id rather than assuming the player.
+        if (!connection.TryGetInventory(sourceEntityId, out var inventory))
             return true;
 
         var slots = inventory.InventoryEntityList;
@@ -123,7 +142,7 @@ public static class InventoryItemTransferToSlot
         // A count smaller than the stack is a split, not a move: dragging half of a 50 stack
         // arrives here as count 25. TrySplitStack returns false when this is an ordinary whole
         // stack move, which then falls through to the swap below.
-        if (connection.TrySplitStack(sourceSlot, targetSlot, count))
+        if (connection.TrySplitStack(sourceSlot, targetSlot, count, inventory))
         {
             Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
 
@@ -133,7 +152,7 @@ public static class InventoryItemTransferToSlot
         // Dropping onto a square holding the same item tops that stack up instead of swapping.
         // Returns false when they are different items or the target is already full, which
         // falls through to the swap below.
-        if (connection.TryMergeStack(sourceSlot, targetSlot, count))
+        if (connection.TryMergeStack(sourceSlot, targetSlot, count, inventory))
         {
             Console.WriteLine($"[inventory] now: {connection.DescribeInventory()}");
 

@@ -35,12 +35,191 @@ public static class GeoDataManager
     /// <summary>Every world/adventure definition, in file order.</summary>
     public static IReadOnlyList<AdventureData> Adventures { get; private set; } = [];
 
+    private static readonly Dictionary<string, LootTableData> _lootTablesByName = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, LootListData> _lootListsByName = new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly Dictionary<byte, VoxelData> _voxelsByIndex = [];
+    private static readonly Dictionary<string, VoxelData> _voxelsByName = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Every block in the client's table, in file order.</summary>
+    public static IReadOnlyList<VoxelData> Voxels { get; private set; } = [];
+
     static GeoDataManager()
     {
         LoadResources();
 
         LoadAdventures();
+
+        LoadVoxels();
+
+        LoadLootTables();
     }
+
+    /// <summary>
+    /// Parse <c>GeoData.json &gt; Voxels</c> — the block table. Each entry carries the
+    /// <c>VoxelIndex</c> used on the wire and the <c>Resource</c> it drops, which is where the
+    /// server's block ids and loot come from.
+    /// </summary>
+    private static void LoadVoxels()
+    {
+        var path = Path.Combine("Data", "GeoData.json");
+
+        if (!File.Exists(path))
+            return;
+
+        using var fileStream = File.OpenRead(path);
+
+        using var jsonDocument = JsonDocument.Parse(fileStream);
+
+        if (!jsonDocument.RootElement.TryGetPropertyIgnoreCase("Voxels", out var voxelsElement) ||
+            voxelsElement.ValueKind != JsonValueKind.Array)
+        {
+            Console.WriteLine("[geodata] no Voxels array; block ids unavailable");
+            return;
+        }
+
+        var voxels = new List<VoxelData>();
+
+        foreach (var element in voxelsElement.EnumerateArray())
+        {
+            if (!element.TryGetPropertyIgnoreCase("Name", out var nameElement) ||
+                nameElement.ValueKind != JsonValueKind.String)
+                continue;
+
+            var name = nameElement.GetString();
+
+            if (string.IsNullOrWhiteSpace(name) ||
+                !element.TryGetPropertyIgnoreCase("Voxel", out var inner) ||
+                inner.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var index = Int(inner, "VoxelIndex");
+
+            if (index is < 0 or > byte.MaxValue)
+                continue;
+
+            var voxel = new VoxelData
+            {
+                Name = name,
+                VoxelIndex = (byte)index,
+                Resource = String(inner, "Resource"),
+                IsPlaceable = Bool(inner, "IsPlaceable"),
+                IsRendered = Bool(inner, "IsRendered"),
+                IsDiggable = Bool(inner, "IsDiggable"),
+                MiningToughness = Int(inner, "MiningToughness"),
+                IsTerrain = Bool(inner, "IsTerrain")
+            };
+
+            voxels.Add(voxel);
+
+            _voxelsByIndex.TryAdd(voxel.VoxelIndex, voxel);
+            _voxelsByName.TryAdd(voxel.Name, voxel);
+        }
+
+        Voxels = voxels;
+
+        Console.WriteLine($"[geodata] {voxels.Count} voxels "
+            + $"({voxels.Count(x => x.IsPlaceable)} placeable, {voxels.Count(x => x.IsDiggable)} diggable, {voxels.Count(x => !x.IsRendered)} invisible)");
+    }
+
+    public static bool TryGetVoxel(byte index, [NotNullWhen(true)] out VoxelData? voxel)
+        => _voxelsByIndex.TryGetValue(index, out voxel);
+
+    public static bool TryGetVoxel(string name, [NotNullWhen(true)] out VoxelData? voxel)
+        => _voxelsByName.TryGetValue(name, out voxel);
+
+    /// <summary>
+    /// Parse <c>GeoData.json &gt; LootTables</c> and <c>LootLists</c> — what harvesting yields.
+    /// </summary>
+    private static void LoadLootTables()
+    {
+        var path = Path.Combine("Data", "GeoData.json");
+
+        if (!File.Exists(path))
+            return;
+
+        using var fileStream = File.OpenRead(path);
+
+        using var jsonDocument = JsonDocument.Parse(fileStream);
+
+        if (jsonDocument.RootElement.TryGetPropertyIgnoreCase("LootLists", out var listsElement) &&
+            listsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var listElement in listsElement.EnumerateArray())
+            {
+                var name = String(listElement, "Name");
+
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                var resources = new List<LootResource>();
+
+                if (listElement.TryGetPropertyIgnoreCase("LootResources", out var resourcesElement) &&
+                    resourcesElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var resourceElement in resourcesElement.EnumerateArray())
+                    {
+                        var resourceName = String(resourceElement, "Name");
+
+                        if (string.IsNullOrWhiteSpace(resourceName))
+                            continue;
+
+                        resources.Add(new LootResource
+                        {
+                            Name = resourceName,
+                            Quantity = Math.Max(1, Int(resourceElement, "Quantity")),
+                            Frequency = Math.Max(1, Int(resourceElement, "Frequency"))
+                        });
+                    }
+                }
+
+                _lootListsByName.TryAdd(name, new LootListData { Name = name, Resources = resources });
+            }
+        }
+
+        if (jsonDocument.RootElement.TryGetPropertyIgnoreCase("LootTables", out var tablesElement) &&
+            tablesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var tableElement in tablesElement.EnumerateArray())
+            {
+                var name = String(tableElement, "Name");
+
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                var entries = new List<LootTableEntry>();
+
+                if (tableElement.TryGetPropertyIgnoreCase("LootTableEntries", out var entriesElement) &&
+                    entriesElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var entryElement in entriesElement.EnumerateArray())
+                    {
+                        var entryName = String(entryElement, "Name");
+
+                        if (string.IsNullOrWhiteSpace(entryName))
+                            continue;
+
+                        entries.Add(new LootTableEntry
+                        {
+                            Name = entryName,
+                            Quantity = Math.Max(1, Int(entryElement, "Quantity")),
+                            SpawnPercentage = Int(entryElement, "SpawnPercentage")
+                        });
+                    }
+                }
+
+                _lootTablesByName.TryAdd(name, new LootTableData { Name = name, Entries = entries });
+            }
+        }
+
+        Console.WriteLine($"[geodata] {_lootTablesByName.Count} loot tables, {_lootListsByName.Count} loot lists");
+    }
+
+    public static bool TryGetLootTable(string name, [NotNullWhen(true)] out LootTableData? table)
+        => _lootTablesByName.TryGetValue(name, out table);
+
+    public static bool TryGetLootList(string name, [NotNullWhen(true)] out LootListData? list)
+        => _lootListsByName.TryGetValue(name, out list);
 
     /// <summary>
     /// Parse <c>GeoData.json &gt; Adventures</c>. Each entry names a world and carries a nested

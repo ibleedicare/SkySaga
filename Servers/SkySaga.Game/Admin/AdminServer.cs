@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 
 using SkySaga.Game.GeoData;
+using SkySaga.Game.World;
 
 namespace SkySaga.Game.Admin;
 
@@ -112,6 +113,11 @@ public sealed class AdminServer
                 TryRespond(context, 200, "text/html; charset=utf-8", AdminPage.Html);
                 break;
 
+            case "/editor":
+            case "/editor.html":
+                TryRespond(context, 200, "text/html; charset=utf-8", EditorPage.Html);
+                break;
+
             case "/api/items":
                 TryRespond(context, 200, "application/json", ItemsJson());
                 break;
@@ -126,6 +132,22 @@ public sealed class AdminServer
 
             case "/api/icons":
                 TryRespond(context, 200, "application/json", IconsJson());
+                break;
+
+            case "/api/world/blocks":
+                TryRespond(context, 200, "application/json", BlocksJson());
+                break;
+
+            case "/api/world/info":
+                TryRespond(context, 200, "application/json", WorldInfoJson());
+                break;
+
+            case "/api/world/chunk":
+                TryRespond(context, 200, "application/json", ChunkJson(context));
+                break;
+
+            case "/api/world/voxel":
+                TryRespond(context, 200, "application/json", SetVoxel(context));
                 break;
 
             default:
@@ -195,6 +217,160 @@ public sealed class AdminServer
         {
             // The browser hung up.
         }
+    }
+
+    /// <summary>
+    /// The client's block table, for the world editor's palette: id, name, the item it drops,
+    /// and whether a player could place it (ore deposits cannot, but an admin still can).
+    /// </summary>
+    private static string BlocksJson()
+    {
+        var blocks = GeoDataManager.Voxels
+            .OrderBy(voxel => voxel.VoxelIndex)
+            .Select(voxel => new
+            {
+                id = voxel.VoxelIndex,
+                name = voxel.Name,
+                resource = voxel.Resource,
+                placeable = voxel.IsPlaceable,
+                rendered = voxel.IsRendered,
+                diggable = voxel.IsDiggable,
+                toughness = voxel.MiningToughness
+            });
+
+        return JsonSerializer.Serialize(blocks);
+    }
+
+    private static string WorldInfoJson()
+    {
+        var (spawnX, spawnY, spawnZ) = TerrainGenerator.Spawn();
+
+        return JsonSerializer.Serialize(new
+        {
+            chunkSize = TerrainGenerator.ChunkSize,
+            sizeChunks = TerrainGenerator.SizeChunks,
+            seed = TerrainGenerator.Seed,
+            spawn = new { x = spawnX, y = spawnY, z = spawnZ }
+        });
+    }
+
+    /// <summary>
+    /// One chunk as the server currently sees it — generated terrain with the players' edits
+    /// applied — so the editor shows the live world rather than a saved file.
+    /// </summary>
+    private string ChunkJson(HttpListenerContext context)
+    {
+        var query = context.Request.QueryString;
+
+        _ = int.TryParse(query["x"], out var chunkX);
+        _ = int.TryParse(query["y"], out var chunkY);
+        _ = int.TryParse(query["z"], out var chunkZ);
+
+        const int size = TerrainGenerator.ChunkSize;
+
+        var voxels = new byte[size * size * size];
+
+        var counts = new Dictionary<byte, int>();
+
+        var edits = _game.World?.VoxelEdits;
+
+        for (var y = 0; y < size; y++)
+        {
+            for (var z = 0; z < size; z++)
+            {
+                for (var x = 0; x < size; x++)
+                {
+                    var world = (X: chunkX * size + x, Y: chunkY * size + y, Z: chunkZ * size + z);
+
+                    var material = edits is not null && edits.TryGetValue(world, out var edited)
+                        ? edited
+                        : TerrainGenerator.MaterialAt(world.X, world.Y, world.Z);
+
+                    voxels[y * size * size + z * size + x] = material;
+
+                    counts[material] = counts.GetValueOrDefault(material) + 1;
+                }
+            }
+        }
+
+        // Histogram by name as well, which makes "is there any ore down here?" answerable
+        // without rendering anything.
+        var summary = counts
+            .OrderByDescending(pair => pair.Value)
+            .ToDictionary(
+                pair => GeoDataManager.TryGetVoxel(pair.Key, out var voxel) ? voxel.Name : pair.Key.ToString(),
+                pair => pair.Value);
+
+        return JsonSerializer.Serialize(new
+        {
+            chunk = new { x = chunkX, y = chunkY, z = chunkZ },
+            size,
+            summary,
+            voxels = Convert.ToBase64String(voxels)
+        });
+    }
+
+    /// <summary>
+    /// Set one voxel from the editor. Applies it to the world overlay and pushes it to the
+    /// connected client, so an edit made in the browser shows up in the running game.
+    /// </summary>
+    private string SetVoxel(HttpListenerContext context)
+    {
+        using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
+
+        int x = 0, y = 0, z = 0, material = 0;
+
+        try
+        {
+            using var document = JsonDocument.Parse(reader.ReadToEnd());
+
+            x = document.RootElement.GetProperty("x").GetInt32();
+            y = document.RootElement.GetProperty("y").GetInt32();
+            z = document.RootElement.GetProperty("z").GetInt32();
+            material = document.RootElement.GetProperty("material").GetInt32();
+        }
+        catch (Exception)
+        {
+            return JsonSerializer.Serialize(new { ok = false, message = "bad request body" });
+        }
+
+        if (material is < 0 or > byte.MaxValue)
+            return JsonSerializer.Serialize(new { ok = false, message = "material out of range" });
+
+        var world = _game.World;
+
+        if (world is null)
+            return JsonSerializer.Serialize(new { ok = false, message = "world not ready" });
+
+        var done = new ManualResetEventSlim(false);
+        var message = "timed out";
+
+        // Runs on the game thread so the edit and the packet cannot race a tick. Editing works
+        // with nobody connected; the push is simply skipped until a player joins, and the
+        // change is in the world either way.
+        _game.Enqueue(() =>
+        {
+            try
+            {
+                world.VoxelEdits[(x, y, z)] = (byte)material;
+
+                _game.FirstConnection?.SendWorldVoxel(x, y, z, (byte)material);
+
+                message = $"({x},{y},{z}) = {material}";
+            }
+            catch (Exception exception)
+            {
+                message = exception.Message;
+            }
+            finally
+            {
+                done.Set();
+            }
+        });
+
+        var completed = done.Wait(TimeSpan.FromSeconds(5));
+
+        return JsonSerializer.Serialize(new { ok = completed, message });
     }
 
     /// <summary>The whole item catalogue, so the panel can render and filter it client-side.</summary>

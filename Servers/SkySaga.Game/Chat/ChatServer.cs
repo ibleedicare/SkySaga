@@ -172,6 +172,50 @@ public sealed class ChatServer
                 break;
             }
 
+            case "/ore":
+            {
+                // Defaults to the carbon seam table, the one ore drop with a distinct item.
+                var table = parts.Length >= 2 ? parts[1] : "CarbonOre_Seam_LootTable";
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.SpawnResourceNode(table);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
+            case "/drop":
+            {
+                if (parts.Length < 2)
+                {
+                    Reply(client, channel, "usage: /drop <item> [count]");
+                    return;
+                }
+
+                var item = parts[1];
+                var count = parts.Length >= 3 && int.TryParse(parts[2], out var dropped) ? dropped : 1;
+
+                _game.Enqueue(() =>
+                {
+                    var connection = _game.FirstConnection;
+
+                    var result = connection is null
+                        ? "no player is online"
+                        : connection.DropPickupInFront(item, count);
+
+                    Reply(client, channel, result);
+                });
+
+                break;
+            }
+
             case "/spawn":
             {
                 if (parts.Length < 2)
@@ -225,9 +269,26 @@ public sealed class ChatServer
 
             case "/chest":
             {
-                // /chest            -> empty chest (minimal: interaction + transform only)
-                // /chest Dirt:10 .. -> also fills the inventory (each arg item or item:count)
-                var loot = parts.Skip(1).Select(entry =>
+                // /chest                       -> a `Chest`, empty
+                // /chest Dirt:10 ..            -> also fills the inventory (item or item:count)
+                // /chest @ChestMinorLootPvP .. -> spawn a different chest entity
+                //
+                // The @name form exists to test chest variants against each other. The three
+                // chests that declare no clientpickupcomponent (ChestMinorLootPvP,
+                // Chest_Adventure_End, Chest_Christmas_Minor) are the useful controls: the
+                // server has no class for that component, so on a plain `Chest` four of its
+                // parameters can never be sent. See documentations/interactables.md.
+                var entityName = "Chest";
+
+                var args = parts.Skip(1).ToList();
+
+                if (args.Count > 0 && args[0].StartsWith('@'))
+                {
+                    entityName = args[0][1..];
+                    args.RemoveAt(0);
+                }
+
+                var loot = args.Select(entry =>
                 {
                     var bits = entry.Split(':', 2);
                     return (Name: bits[0], Count: bits.Length > 1 && int.TryParse(bits[1], out var c) ? c : 1);
@@ -239,7 +300,7 @@ public sealed class ChatServer
 
                     var result = connection is null
                         ? "no player is online"
-                        : connection.SpawnChest(loot);
+                        : connection.SpawnChest(loot, entityName);
 
                     Reply(client, channel, result);
                 });
@@ -248,7 +309,7 @@ public sealed class ChatServer
             }
 
             case "/help":
-                Reply(client, channel, "commands: /give <item> [count], /spawn <entity>, /chest [item[:count]...]");
+                Reply(client, channel, "commands: /give <item> [count], /spawn <entity>, /chest [@Entity] [item[:count]...]");
                 break;
 
             default:
